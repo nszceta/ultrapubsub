@@ -1,0 +1,54 @@
+🚀 UltraPubSub 35MB@40Hz Performance Test
+==================================================
+📊 Test Configuration:
+   Payload size: 35MB
+   Target frequency: 40Hz
+   Test duration: 10 seconds
+   Expected throughput: 1.4GB/s (35MB × 40Hz)
+==================================================
+📡 Subscriber 0 started
+📡 Subscriber 1 started
+📡 Subscriber 2 started
+📡 Subscriber 3 started
+📡 Subscriber 4 started
+📡 Subscriber 5 started
+📦 Creating 35MB test payload...
+✅ Payload created: 35MB
+
+📤 Starting publisher at 40Hz...
+📡 Subscriber 4 completed: 0 messages
+📡 Subscriber 3 completed: 0 messages
+📡 Subscriber 5 completed: 0 messages
+📡 Subscriber 2 completed: 0 messages
+📡 Subscriber 1 completed: 1 messages
+📡 Subscriber 0 completed: 1 messages
+
+📊 Publisher Results:
+   Messages sent: 391
+   Total data: 0.14GB
+   Duration: 13.08s
+   Frequency: 29.88Hz (target: 40Hz)
+   Throughput: 0.01GB/s
+
+📡 Subscriber Results:
+   Total messages received: 2
+   Average latency: 3697.71ms
+   Maximum latency: 4078.04ms
+
+📈 Per-subscriber breakdown:
+   Sub 1: 1 msgs, 3.1MB/s, latency: 4078.04ms (max: 4078.04ms)
+   Sub 0: 1 msgs, 3.0MB/s, latency: 3317.38ms (max: 3317.38ms)
+
+🎯 Success Metrics:
+   Expected messages: 2346
+   Success rate: 0.1%
+   Target frequency achieved: ❌ (29.9Hz)
+   Low latency maintained: ❌ (3697.7ms)
+
+❌ PERFORMANCE TEST FAILED
+   ❌ Frequency too low: 29.9Hz < 38Hz
+   ❌ Latency too high: 3697.7ms >= 50ms
+   ❌ Success rate too low: 0.1% < 80%
+
+💥 UltraPubSub did not meet performance targets
+❌ System optimization needed for target performance
