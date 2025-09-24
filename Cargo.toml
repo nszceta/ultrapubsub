@@ -12,3 +12,5 @@ io-uring = "0.7.10"
 pyo3 = { version = "0.26", features = ["extension-module"] }
 libc = "0.2.176"
 memmap2 = "0.9.8"
+nix = { version = "0.29", features = ["fs", "mman", "process"] }
+fcntl = "0.1"

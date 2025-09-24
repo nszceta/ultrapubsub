@@ -1,4 +1,4 @@
-# Implementation Findings - ultrapubsub PoC
+# Project Implementation Findings - ultrapubsub
 
 ## Key Surprises and Learnings
 
