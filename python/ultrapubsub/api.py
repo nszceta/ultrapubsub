@@ -6,6 +6,7 @@ simplifying the creation of publishers and subscribers for inter-process communi
 """
 
 import os
+import sys
 import multiprocessing
 from typing import Optional, Callable, Any
 from .ultrapubsub import PyHring, PyPublisher, PySubscriber
@@ -224,6 +225,7 @@ class Subscriber:
         import time
         start_time = time.time()
 
+        
         # Use blocking event-driven behavior with timeout
         while True:
             # Try non-blocking receive first
@@ -231,7 +233,7 @@ class Subscriber:
                 result = self._subscriber.try_receive()
                 if result:
                     return result
-            except Exception:
+            except Exception as e:
                 pass
 
             # Check timeout

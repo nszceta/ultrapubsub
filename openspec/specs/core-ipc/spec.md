@@ -2,59 +2,68 @@
 
 ## Purpose
 
-The Core IPC capability provides high-performance inter-process communication using Linux io_uring with shared memory pools. It enables zero-copy message passing between processes with sophisticated memory management and support for large binary data transmission up to 20MB+ at 40Hz frequency.
+The Core IPC capability provides high-performance inter-process communication using Shared Memory Ring Buffer with atomic operations. It enables zero-copy message passing between processes with lock-free synchronization and support for large binary data transmission at 1.4 GB/s throughput (35 MB payloads at 40 Hz).
 
 ## Overview
 
-This specification defines the requirements for implementing a complete io_uring-based IPC system that replaces the previous flawed stdout-based implementation with true multi-process communication achieving real IPC performance targets.
+This specification defines the requirements for implementing a complete Shared Memory Ring Buffer-based IPC system that replaces the previous flawed io_uring-based implementation with true zero-copy, lock-free multi-process communication achieving maximum performance targets.
 
 ## Requirements
 
-### Requirement: Shared Memory Pool Management
-The system SHALL provide a bitmap-based shared memory pool for efficient block allocation and deallocation.
+### Requirement: Shared Memory Ring Buffer Management
+The system SHALL provide a shared memory ring buffer with atomic operations for lock-free 1:N pub/sub messaging.
 
-#### Scenario: Block Allocation Success
-- **WHEN** a process requests a memory block from the pool
-- **THEN** the system SHALL allocate a contiguous block and return its 64-bit HringAddr
-- **AND** the block SHALL be marked as allocated in the bitmap
+#### Scenario: Ring Buffer Creation
+- **WHEN** creating a shared memory region for pub/sub
+- **THEN** the system SHALL allocate a contiguous circular buffer
+- **AND** the system SHALL initialize atomic head pointer for publisher
+- **AND** the system SHALL initialize atomic tail pointers for each subscriber
+- **AND** the system SHALL create message availability bitmap
 
-#### Scenario: Block Deallocation Success
-- **WHEN** a process frees a memory block using its HringAddr
-- **THEN** the system SHALL mark the block as available in the bitmap
-- **AND** the memory SHALL be available for subsequent allocations
+#### Scenario: Zero-Copy 1:N Publishing
+- **WHEN** a publisher writes a message
+- **THEN** the system SHALL write directly to shared memory buffer
+- **AND** the system SHALL update atomic head pointer
+- **AND** the system SHALL set availability bits for all subscribers
+- **AND** no data copying SHALL occur between publisher and subscribers
 
-#### Scenario: Pool Exhaustion Handling
-- **WHEN** the memory pool has no available blocks
-- **THEN** the system SHALL return an allocation error
-- **AND** no memory SHALL be allocated
+#### Scenario: Concurrent Subscriber Access
+- **WHEN** multiple subscribers read messages
+- **THEN** each subscriber SHALL maintain independent tail pointers
+- **AND** subscribers SHALL read directly from shared memory
+- **AND** no contention SHALL occur between subscribers
+- **AND** all subscribers SHALL see identical message data
 
-### Requirement: Multi-Process Communication
-The system SHALL support true inter-process communication using fork/exec with io_uring ring sharing.
+### Requirement: Atomic Operations for Synchronization
+The system SHALL use atomic operations for all synchronization to achieve lock-free performance.
 
-#### Scenario: Process Creation with Ring Sharing
-- **WHEN** a parent process creates a child process
-- **THEN** the child SHALL be able to attach to the parent's io_uring rings
-- **AND** both processes SHALL share the same completion ring
-- **AND** message passing SHALL work bidirectionally between processes
+#### Scenario: Atomic Head Updates
+- **WHEN** publisher advances write position
+- **THEN** head pointer SHALL be updated atomically
+- **AND** the operation SHALL be wait-free
+- **AND** no locks SHALL be acquired or contended
 
-#### Scenario: Cross-Process File Descriptor Sharing
-- **WHEN** a child process needs access to the parent's io_uring ring file descriptor
-- **THEN** the system SHALL use pidfd_getfd() to safely share the descriptor
-- **AND** the shared descriptor SHALL function correctly in the child process
+#### Scenario: Atomic Tail Updates
+- **WHEN** subscriber advances read position
+- **THEN** tail pointer SHALL be updated atomically
+- **AND** the operation SHALL be wait-free
+- **AND** no locks SHALL be acquired or contended
 
-#### Scenario: Process Cleanup
-- **WHEN** a process exits or crashes
-- **THEN** all allocated memory blocks SHALL be properly freed
-- **AND** shared memory resources SHALL be cleaned up
+#### Scenario: Availability Bitmap Updates
+- **WHEN** publisher marks message as available
+- **THEN** bitmap SHALL be updated atomically
+- **AND** subscribers SHALL see updates immediately
+- **AND** no race conditions SHALL occur
 
 ### Requirement: Large Binary Blob Transmission
-The system SHALL support transmission of large binary data (up to 20MB+) with integrity verification.
+The system SHALL support transmission of large binary data (35 MB payloads) with integrity verification at 40 Hz frequency.
 
 #### Scenario: Large Blob Generation
 - **WHEN** generating a large binary blob for transmission
-- **THEN** the system SHALL create blobs of specified sizes (1MB, 5MB, 10MB, 20MB)
+- **THEN** the system SHALL create 35 MB payloads
 - **AND** each blob SHALL include indisputable header and footer signatures
 - **AND** the payload SHALL be deterministic and verifiable
+- **AND** generation SHALL sustain 40 Hz frequency
 
 #### Scenario: Signature Verification
 - **WHEN** a blob is received
@@ -114,22 +123,23 @@ The system SHALL provide proper shared memory management with unique naming conv
 The system SHALL achieve performance targets suitable for high-frequency messaging scenarios.
 
 #### Scenario: High-Frequency Messaging
-- **WHEN** sending messages at 40Hz frequency
-- **THEN** the system SHALL sustain 800MB/s throughput (20MB × 40Hz)
-- **AND** latency SHALL remain below 1ms per message
-- **AND** the system SHALL handle 6 concurrent subscribers
+- **WHEN** sending 35 MB payloads at 40 Hz frequency
+- **THEN** the system SHALL sustain 1.4 GB/s throughput (35 MB × 40 Hz)
+- **AND** latency SHALL remain below 25ms per message (40 Hz cycle time)
+- **AND** the system SHALL handle exactly 6 concurrent subscribers with zero-copy sharing
 
 #### Scenario: Large Data Performance
-- **WHEN** transmitting 20MB binary blobs
-- **THEN** the system SHALL maintain stable transmission rates
-- **AND** memory usage SHALL remain within expected limits
-- **AND** no significant performance degradation SHALL occur
+- **WHEN** transmitting 35MB binary blobs at 40 Hz
+- **THEN** the system SHALL maintain stable 1.4 GB/s transmission rates
+- **AND** memory usage SHALL remain within expected limits for 6 subscribers
+- **AND** no timing jitter SHALL occur in the 40 Hz cycle
 
 #### Scenario: Multi-Subscriber Scalability
 - **WHEN** multiple subscribers attach to the same publisher
-- **THEN** the system SHALL support at least 6 concurrent subscribers
-- **AND** each subscriber SHALL receive identical data
-- **AND** performance SHALL scale linearly with subscriber count
+- **THEN** all subscribers SHALL receive identical 35MB data simultaneously
+- **AND** zero-copy semantics SHALL ensure no additional memory overhead per subscriber
+- **AND** all subscribers SHALL complete processing within the 25ms cycle time
+- **AND** performance SHALL scale linearly from 1 to at least 6 subscribers
 
 ### Requirement: Error Handling and Recovery
 The system SHALL provide robust error handling and recovery mechanisms.
@@ -176,10 +186,12 @@ The system SHALL integrate properly with the Linux operating system and developm
 ## Non-Functional Requirements
 
 ### Performance Requirements
-- **Latency**: Target < 270ns for basic message passing (based on vendor benchmarks)
-- **Throughput**: Support 800MB/s sustained data transfer
-- **Scalability**: Handle 6+ concurrent subscribers without performance degradation
+- **Throughput**: Support 1.4 GB/s sustained data transfer (35 MB × 40 Hz)
+- **Latency**: Target < 25ms per message (40 Hz cycle time)
+- **Frequency**: Maintain consistent 40 Hz message rate with no jitter
+- **Subscribers**: Support multiple concurrent subscribers (at least 6) with zero-copy sharing
 - **Memory Efficiency**: Maintain zero-copy semantics throughout the system
+- **Payload Size**: Handle 35 MB payloads efficiently
 
 ### Reliability Requirements
 - **Stability**: System SHALL remain stable under continuous load
@@ -188,41 +200,43 @@ The system SHALL integrate properly with the Linux operating system and developm
 - **Error Recovery**: Graceful handling of error conditions
 
 ### Compatibility Requirements
-- **Platform**: Linux-only (io_uring is Linux-specific)
-- **Kernel**: Require Linux kernel 5.1+ for io_uring support
+- **Platform**: Linux-only (atomic operations and shared memory)
+- **Kernel**: Require Linux kernel 3.2+ for atomic operations support
 - **Python**: Support Python 3.8+ with PyO3 bindings
 - **Architecture**: Support x86_64 and ARM64 architectures
 
 ## Testing Requirements
 
 ### Unit Testing
-- **Memory Pool**: Test all allocation and deallocation scenarios
-- **HringAddr**: Test address creation, validation, and usage
+- **Ring Buffer**: Test all ring buffer operations and wrap-around scenarios
+- **Atomic Operations**: Test atomic head/tail pointer updates and synchronization
 - **Shared Memory**: Test creation, attachment, and cleanup
-- **Error Handling**: Test all error conditions and recovery paths
+- **Bitmap Management**: Test message availability bitmap operations
 
 ### Integration Testing
-- **Multi-Process**: Test fork/exec scenarios with ring sharing
-- **Large Data**: Test transmission of 1MB-20MB binary blobs
-- **Performance**: Verify performance targets are met
+- **Multi-Process**: Test independent process attachment to shared memory
+- **Large Data**: Test zero-copy transmission of 35 MB binary blobs
+- **Performance**: Verify 1.4 GB/s performance targets are met (35 MB × 40 Hz)
+- **Frequency Testing**: Verify consistent 40 Hz message rate
 - **Python Integration**: Test all Python APIs and error handling
 
 ### Stress Testing
-- **High Frequency**: Test sustained 40Hz messaging
-- **Concurrent Access**: Test multiple concurrent processes
-- **Memory Pressure**: Test behavior under memory constraints
-- **Long Duration**: Test stability over extended periods
+- **High Frequency**: Test sustained 40 Hz messaging with 35 MB payloads
+- **Concurrent Access**: Test multiple concurrent subscribers (at least 6)
+- **Memory Pressure**: Test behavior with 35 MB × 6 subscribers memory footprint
+- **Timing Accuracy**: Test 25ms cycle time precision over extended periods
+- **Long Duration**: Test stability over extended 40 Hz operation
 
 ## Security Considerations
 
 ### Memory Safety
-- **Bounds Checking**: All memory accesses SHALL be bounds-checked
-- **Null Termination**: String operations SHALL properly handle null termination
-- **Reference Validation**: All HringAddr references SHALL be validated before use
+- **Bounds Checking**: All ring buffer accesses SHALL be bounds-checked
+- **Atomic Operations**: All atomic operations SHALL use proper memory ordering
+- **Pointer Validation**: All head/tail pointers SHALL be validated before use
 
 ### Process Isolation
-- **File Descriptor Sharing**: Use pidfd_getfd() for secure descriptor sharing
 - **Memory Protection**: Shared memory regions SHALL have appropriate permissions
+- **Independent Attachment**: Each process SHALL attach independently to shared memory
 - **Process Cleanup**: Ensure proper cleanup when processes terminate unexpectedly
 
 ### Data Integrity

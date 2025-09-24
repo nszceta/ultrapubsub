@@ -1,0 +1,6 @@
+2025-09-24 15:27:59,962 - INFO - === Single Process IPC Debug Test ===
+2025-09-24 15:27:59,962 - INFO - Publisher created
+2025-09-24 15:27:59,962 - INFO - Subscriber created
+2025-09-24 15:27:59,962 - INFO - Sending message: b'Hello IPC test!'
+2025-09-24 15:27:59,962 - INFO - Message sent successfully
+2025-09-24 15:28:01,063 - ERROR - ❌ No message received in single process
