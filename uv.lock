@@ -254,6 +254,7 @@ dev = [
     { name = "pytest", version = "8.4.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.9'" },
     { name = "pytest-benchmark", version = "4.0.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.9'" },
     { name = "pytest-benchmark", version = "5.1.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.9'" },
+    { name = "ultrapubsub" },
 ]
 
 [package.metadata]
@@ -263,4 +264,5 @@ requires-dist = [{ name = "psutil", specifier = ">=7.1.0" }]
 dev = [
     { name = "pytest", specifier = ">=8.0" },
     { name = "pytest-benchmark", specifier = ">=4.0" },
+    { name = "ultrapubsub", editable = "." },
 ]

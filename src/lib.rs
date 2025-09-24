@@ -94,9 +94,6 @@ const IORING_SQ_CQ_OVERFLOW: u32 = 1 << 0;
 const IORING_SQ_TASKRUN: u32 = 1 << 1;
 const IORING_ENTER_GETEVENTS: u32 = 1 << 0;
 
-// Block size for memory pool (32MB to handle large messages)
-const BLOCK_SIZE: usize = 32 * 1024 * 1024;
-
 // 64-bit memory address type (equivalent to hring_addr_t)
 pub type HringAddr = u64;
 
@@ -109,50 +106,101 @@ pub fn hring_addr_len(addr: HringAddr) -> u32 {
     (addr >> 32) as u32
 }
 
-// Shared memory pool with bitmap allocation (equivalent to hring_mpool)
+// Shared memory pool with variable-size allocation
+const BLOCK_SIZE: usize = 32 * 1024 * 1024; // Maximum block size (32MB)
+const MIN_BLOCK_SIZE: usize = 64; // Minimum allocation granularity
+const NUM_BLOCK_SIZES: usize = 20; // Number of different block sizes
+
 #[repr(C)]
 #[derive(Clone)]
 pub struct SharedMemoryPool {
-    blocks: u32,
+    total_size: usize,
     bitmap: *mut AtomicU64,
     map: *mut u8,  // Actual shared memory region
+    free_lists: [*mut AtomicU32; NUM_BLOCK_SIZES], // Free lists for different block sizes
 }
 
 impl SharedMemoryPool {
+    // Get block size index for allocation
+    fn get_block_size_index(size: usize) -> usize {
+        if size <= MIN_BLOCK_SIZE {
+            return 0;
+        }
+        // Find the smallest block size that can accommodate the request
+        let mut index = 0;
+        let mut block_size = MIN_BLOCK_SIZE;
+        while block_size < size && index < NUM_BLOCK_SIZES - 1 {
+            index += 1;
+            block_size *= 2;
+        }
+        index
+    }
+
+    // Get actual block size for index
+    fn get_block_size(index: usize) -> usize {
+        if index >= NUM_BLOCK_SIZES {
+            return BLOCK_SIZE;
+        }
+        MIN_BLOCK_SIZE << index
+    }
+
     // Create a new memory pool (for parent process)
-    pub fn new(blocks: u32) -> Result<Self, Box<dyn std::error::Error>> {
-        let bitmap_size = (blocks as usize + 63) / 64;
+    pub fn new(total_size: usize) -> Result<Self, Box<dyn std::error::Error>> {
+        let num_blocks = total_size / MIN_BLOCK_SIZE;
+        let bitmap_size = (num_blocks + 63) / 64;
+
+        // Allocate bitmap
         let bitmap = unsafe {
             let layout = std::alloc::Layout::array::<AtomicU64>(bitmap_size)?;
             std::alloc::alloc(layout) as *mut AtomicU64
         };
-        
+
         // Initialize bitmap to all ones (all blocks free)
         for i in 0..bitmap_size {
             unsafe {
                 ptr::write_volatile(bitmap.add(i), AtomicU64::new(u64::MAX));
             }
         }
-        
-        let total_size = blocks as usize * BLOCK_SIZE;
+
+        // Allocate shared memory
         let map = unsafe {
             let layout = std::alloc::Layout::array::<u8>(total_size)?;
             std::alloc::alloc(layout) as *mut u8
         };
-        
+
+        // Initialize free lists
+        let mut free_lists = [ptr::null_mut(); NUM_BLOCK_SIZES];
+        for i in 0..NUM_BLOCK_SIZES {
+            free_lists[i] = unsafe {
+                let layout = std::alloc::Layout::array::<AtomicU32>(1024)?; // Pre-allocate free list space
+                std::alloc::alloc(layout) as *mut AtomicU32
+            };
+            // Initialize free list head
+            unsafe {
+                ptr::write_volatile(free_lists[i], AtomicU32::new(0));
+            }
+        }
+
         Ok(Self {
-            blocks,
+            total_size,
             bitmap,
             map,
+            free_lists,
         })
     }
     
     // Create memory pool from existing shared memory (for child process)
-    pub unsafe fn from_shared_memory(blocks: u32, bitmap_ptr: *mut AtomicU64, map_ptr: *mut u8) -> Self {
+    pub unsafe fn from_shared_memory(total_size: usize, bitmap_ptr: *mut AtomicU64, map_ptr: *mut u8, free_lists_ptr: *mut AtomicU32) -> Self {
+        let mut free_lists = [ptr::null_mut(); NUM_BLOCK_SIZES];
+        for i in 0..NUM_BLOCK_SIZES {
+            free_lists[i] = free_lists_ptr.add(i * 1024);
+        }
+
         Self {
-            blocks,
+            total_size,
             bitmap: bitmap_ptr,
             map: map_ptr,
+            free_lists,
         }
     }
     
@@ -168,70 +216,134 @@ impl SharedMemoryPool {
         result
     }
     
-    // Allocate a block from the memory pool (equivalent to hring_mpool_alloc)
+    // Allocate memory from the pool
     pub fn alloc(&self, size: usize) -> Result<HringAddr, Box<dyn std::error::Error>> {
-        // // println!("DEBUG: alloc called with size: {}, blocks: {}, bitmap: {:p}, map: {:p}", size, self.blocks, self.bitmap, self.map);
         if size == 0 {
             return Err("Size cannot be zero".into());
         }
-        
+
         if size > BLOCK_SIZE {
-            return Err("Size exceeds block size".into());
+            return Err("Size exceeds maximum block size".into());
         }
-        
-        let size_part = (size as u32 as u64) << 32;
-        let bitmap = unsafe { slice::from_raw_parts(self.bitmap, (self.blocks as usize + 63) / 64) };
-        
+
+        let block_size_index = Self::get_block_size_index(size);
+        let actual_block_size = Self::get_block_size(block_size_index);
+        let num_min_blocks = actual_block_size / MIN_BLOCK_SIZE;
+
+        // Try to find contiguous blocks
+        let bitmap = unsafe { slice::from_raw_parts(self.bitmap, (self.total_size / MIN_BLOCK_SIZE + 63) / 64) };
+
         for i in 0..bitmap.len() {
-            let bit = self.bitmap_find_free(&bitmap[i]);
-            
-            if bit != 0 {
-                let bit_idx = bit - 1;
-                
-                // Mark block as allocated
-                let mask = !(1u64 << bit_idx);
-                bitmap[i].fetch_and(mask, Ordering::Relaxed);
-                
-                let block_index = (i * 64 + bit_idx as usize) as u32;
-                let addr = (size_part & 0xFFFFFFFF00000000) | (block_index as u64 & 0xFFFFFFFF);
-                // // println!("DEBUG: alloc returning addr: {} (size_part: {}, block_index: {})", addr, size_part, block_index);
+            // Check if we have enough contiguous free blocks
+            if self.has_contiguous_blocks(bitmap, i, num_min_blocks) {
+                // Mark blocks as allocated
+                self.mark_blocks_allocated(bitmap, i, num_min_blocks);
+
+                let start_block = i * 64;
+                let size_part = (size as u32 as u64) << 32;
+                let addr = (size_part & 0xFFFFFFFF00000000) | (start_block as u64 & 0xFFFFFFFF);
                 return Ok(addr);
             }
         }
-        
+
         Err("No free blocks available".into())
     }
+
+    // Check if we have enough contiguous free blocks starting from bitmap word index
+    fn has_contiguous_blocks(&self, bitmap: &[AtomicU64], start_word: usize, num_blocks: usize) -> bool {
+        let mut remaining_blocks = num_blocks;
+        let mut current_word = start_word;
+        let mut current_bit = 0;
+
+        while remaining_blocks > 0 {
+            if current_word >= bitmap.len() {
+                return false;
+            }
+
+            let word_value = bitmap[current_word].load(Ordering::Relaxed);
+            let bits_available = 64 - current_bit;
+            let blocks_to_check = std::cmp::min(remaining_blocks, bits_available);
+
+            // Create mask for the bits we want to check
+            let mask = if bits_available == 64 {
+                u64::MAX
+            } else {
+                (1u64 << blocks_to_check) - 1
+            } << current_bit;
+
+            if (word_value & mask) != mask {
+                return false;
+            }
+
+            remaining_blocks -= blocks_to_check;
+            current_word += 1;
+            current_bit = 0;
+        }
+
+        true
+    }
+
+    // Mark blocks as allocated
+    fn mark_blocks_allocated(&self, bitmap: &[AtomicU64], start_word: usize, num_blocks: usize) {
+        let mut remaining_blocks = num_blocks;
+        let mut current_word = start_word;
+        let mut current_bit = 0;
+
+        while remaining_blocks > 0 {
+            let bits_available = 64 - current_bit;
+            let blocks_to_clear = std::cmp::min(remaining_blocks, bits_available);
+
+            // Create mask to clear the bits
+            let mask = !(((1u64 << blocks_to_clear) - 1) << current_bit);
+            bitmap[current_word].fetch_and(mask, Ordering::Relaxed);
+
+            remaining_blocks -= blocks_to_clear;
+            current_word += 1;
+            current_bit = 0;
+        }
+    }
     
-    // Free a block back to the memory pool (equivalent to hring_mpool_free)
+    // Free memory back to the pool
     pub fn free(&self, addr: HringAddr) -> Result<(), Box<dyn std::error::Error>> {
         let offset = hring_addr_off(addr) as usize;
-        
+        let size = hring_addr_len(addr) as usize;
+
+        if size == 0 {
+            return Err("Cannot free zero-size allocation".into());
+        }
+
+        let block_size_index = Self::get_block_size_index(size);
+        let actual_block_size = Self::get_block_size(block_size_index);
+        let num_min_blocks = actual_block_size / MIN_BLOCK_SIZE;
+
         // Check bounds
-        if offset >= self.blocks as usize {
+        if offset + num_min_blocks > self.total_size / MIN_BLOCK_SIZE {
             return Err("Block offset out of bounds".into());
         }
-        
-        let bitmap_idx = offset / 64;
-        let bit_idx = offset % 64;
-        
-        let bitmap = unsafe { slice::from_raw_parts(self.bitmap, (self.blocks as usize + 63) / 64) };
-        
-        // Check if block is currently allocated
-        if bitmap[bitmap_idx].load(Ordering::Relaxed) & (1 << bit_idx) != 0 {
-            return Err("Block already free".into());
+
+        let bitmap = unsafe { slice::from_raw_parts(self.bitmap, (self.total_size / MIN_BLOCK_SIZE + 63) / 64) };
+
+        // Mark blocks as free
+        let mut remaining_blocks = num_min_blocks;
+        let mut current_block = offset;
+
+        while remaining_blocks > 0 {
+            let bitmap_idx = current_block / 64;
+            let bit_idx = current_block % 64;
+
+            bitmap[bitmap_idx].fetch_or(1 << bit_idx, Ordering::Relaxed);
+
+            remaining_blocks -= 1;
+            current_block += 1;
         }
-        
-        // Mark block as free
-        bitmap[bitmap_idx].fetch_or(1 << bit_idx, Ordering::Relaxed);
-        
+
         Ok(())
     }
     
-    // Get pointer to block memory (equivalent to hring_deref)
+    // Get pointer to allocated memory
     pub fn deref(&self, addr: HringAddr) -> *mut u8 {
         let offset = hring_addr_off(addr) as usize;
-        let ptr = unsafe { self.map.add(offset * BLOCK_SIZE) };
-        // // println!("DEBUG: deref called with addr: {}, offset: {}, map: {:p}, result: {:p}", addr, offset, self.map, ptr);
+        let ptr = unsafe { self.map.add(offset * MIN_BLOCK_SIZE) };
         ptr
     }
 }
@@ -400,9 +512,11 @@ impl Hring {
                 ptr::write_volatile(bitmap_ptr.add(i), AtomicU64::new(u64::MAX));
             }
             
-            let data_ptr = map_ptr.add(bitmap_bytes) as *mut u8;
-            
-            SharedMemoryPool::from_shared_memory(4096, bitmap_ptr, data_ptr)
+            let free_lists_bytes = NUM_BLOCK_SIZES * 1024 * std::mem::size_of::<AtomicU32>();
+            let free_lists_ptr = map_ptr.add(bitmap_bytes) as *mut AtomicU32;
+            let data_ptr = map_ptr.add(bitmap_bytes + free_lists_bytes) as *mut u8;
+
+            SharedMemoryPool::from_shared_memory(4096 * BLOCK_SIZE, bitmap_ptr, data_ptr, free_lists_ptr)
         };
         
         Ok(Self {
@@ -650,9 +764,11 @@ impl Hring {
             }
             
             let bitmap_ptr = map_ptr as *mut AtomicU64;
-            let data_ptr = map_ptr.add(bitmap_bytes) as *mut u8;
-            
-            SharedMemoryPool::from_shared_memory(4096, bitmap_ptr, data_ptr)
+            let free_lists_bytes = NUM_BLOCK_SIZES * 1024 * std::mem::size_of::<AtomicU32>();
+            let free_lists_ptr = map_ptr.add(bitmap_bytes) as *mut AtomicU32;
+            let data_ptr = map_ptr.add(bitmap_bytes + free_lists_bytes) as *mut u8;
+
+            SharedMemoryPool::from_shared_memory(4096 * BLOCK_SIZE, bitmap_ptr, data_ptr, free_lists_ptr)
         };
         
         // Map completion ring for subscriber using our new io_uring instance
@@ -989,18 +1105,94 @@ impl Publisher {
         // println!("DEBUG: Queued: {}, queued count: {}", addr, queued);
         
         // Submit to io_uring
-        let submit_result = self.hring.submit(queued > 0)?;
+        let _submit_result = self.hring.submit(queued > 0)?;
         // println!("DEBUG: Submit result: {}", submit_result);
         
         // Test: let parent try to read its own completion ring
         // println!("DEBUG: Parent testing completion ring read:");
         let mut parent_test_received = false;
-        let _ = self.hring.dequeue_with_callback(|cqe| {
+        let _ = self.hring.dequeue_with_callback(|_cqe| {
             // println!("DEBUG: Parent received CQE with user_data: {}", cqe.user_data);
             parent_test_received = true;
         });
         // println!("DEBUG: Parent completion ring test: received = {}", parent_test_received);
-        
+
+        Ok(())
+    }
+
+    // Publish data directly from shared memory (true zero-copy)
+    pub fn publish_shared(&mut self, shared_data_ptr: *const u8, len: usize) -> Result<(), Box<dyn std::error::Error>> {
+        // // println!("DEBUG: Publishing shared data: {:p}, len: {}", shared_data_ptr, len);
+
+        // For true zero-copy, we assume the data is already in shared memory
+        // We just need to create an address reference to it
+
+        // Calculate offset from the shared memory base
+        let pool_map = self.hring.pool.map;
+        let offset = (shared_data_ptr as usize - pool_map as usize) / MIN_BLOCK_SIZE;
+
+        // Verify the pointer is within our shared memory region
+        if offset * MIN_BLOCK_SIZE >= self.hring.pool.total_size {
+            return Err("Shared data pointer is outside of memory pool".into());
+        }
+
+        // Create address with offset and length
+        let size_part = (len as u32 as u64) << 32;
+        let addr = (size_part & 0xFFFFFFFF00000000) | (offset as u64 & 0xFFFFFFFF);
+
+        // Queue the address using NOP operation
+        let queued = self.hring.try_queue(addr)?;
+
+        // Submit to io_uring
+        let _submit_result = self.hring.submit(queued > 0)?;
+
+        Ok(())
+    }
+
+    // Get direct write access to shared memory (for true zero-copy)
+    pub fn allocate_and_write(&mut self, len: usize) -> Result<*mut u8, Box<dyn std::error::Error>> {
+        // Allocate memory from pool
+        let addr = self.hring.pool.alloc(len)?;
+
+        // Return pointer to shared memory
+        let ptr = self.hring.pool.deref(addr);
+
+        // Note: The caller must call publish_allocation() after writing data
+        Ok(ptr)
+    }
+
+    // Publish pre-allocated shared memory
+    pub fn publish_allocation(&mut self, ptr: *mut u8, len: usize) -> Result<(), Box<dyn std::error::Error>> {
+        // Calculate offset from the shared memory base
+        let pool_map = self.hring.pool.map;
+        let offset = (ptr as usize - pool_map as usize) / MIN_BLOCK_SIZE;
+
+        // Create address with offset and length
+        let size_part = (len as u32 as u64) << 32;
+        let addr = (size_part & 0xFFFFFFFF00000000) | (offset as u64 & 0xFFFFFFFF);
+
+        // Queue the address using NOP operation
+        let queued = self.hring.try_queue(addr)?;
+
+        // Submit to io_uring
+        let _submit_result = self.hring.submit(queued > 0)?;
+
+        Ok(())
+    }
+
+    // Free memory after subscriber consumption
+    pub fn free_memory(&mut self, ptr: *mut u8, len: usize) -> Result<(), Box<dyn std::error::Error>> {
+        // Calculate offset from the shared memory base
+        let pool_map = self.hring.pool.map;
+        let offset = (ptr as usize - pool_map as usize) / MIN_BLOCK_SIZE;
+
+        // Create address with offset and length
+        let size_part = (len as u32 as u64) << 32;
+        let addr = (size_part & 0xFFFFFFFF00000000) | (offset as u64 & 0xFFFFFFFF);
+
+        // Free the memory
+        self.hring.pool.free(addr)?;
+
         Ok(())
     }
 }
@@ -1177,6 +1369,25 @@ impl PyPublisher {
     
     pub fn publish(&mut self, data: Vec<u8>) -> PyResult<()> {
         self.inner.publish(&data)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+    }
+
+    // Allocate shared memory and return pointer for direct writing
+    pub fn allocate_and_write(&mut self, len: usize) -> PyResult<usize> {
+        self.inner.allocate_and_write(len)
+            .map(|ptr| ptr as usize)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+    }
+
+    // Publish pre-allocated shared memory
+    pub fn publish_allocation(&mut self, ptr: usize, len: usize) -> PyResult<()> {
+        self.inner.publish_allocation(ptr as *mut u8, len)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+    }
+
+    // Free memory after consumption
+    pub fn free_memory(&mut self, ptr: usize, len: usize) -> PyResult<()> {
+        self.inner.free_memory(ptr as *mut u8, len)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
     }
 }
