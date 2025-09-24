@@ -12,7 +12,7 @@ from ultrapubsub import SharedMemory
 def publisher_test():
     """Simple publisher test"""
     try:
-        shm = SharedMemory('test', 32, 0, 0)
+        shm = SharedMemory('test')
         publisher = shm.create_publisher()
 
         # Send a simple message

@@ -12,7 +12,7 @@ def test_single_process():
     """Test both publisher and subscriber in same process"""
     try:
         print("Creating shared memory...")
-        shm = SharedMemory('test_single', 32, 0, 0)
+        shm = SharedMemory('test_single')
 
         print("Creating publisher...")
         publisher = shm.create_publisher()

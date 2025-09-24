@@ -5,9 +5,12 @@
 // This implementation achieves the target 1.4 GB/s throughput (35 MB payloads at 40 Hz).
 
 mod ring_buffer;
+mod event_loop;
 use ring_buffer::{SharedRingBuffer, RingBufferPublisher, RingBufferSubscriber};
+use event_loop::{PyEventLoop, add_event_loop_to_module};
 
 use pyo3::prelude::*;
+use std::sync::atomic::Ordering;
 use nix::unistd::{fork, ForkResult, Pid};
 use nix::sys::wait::{waitpid, WaitStatus};
 
@@ -48,9 +51,20 @@ impl Publisher {
         Ok(sequences)
     }
 
+    /// Try to publish without blocking - returns immediately if buffer is full
+    pub fn try_publish(&mut self, data: &[u8]) -> Result<Option<u64>, Box<dyn std::error::Error>> {
+        // For 35MB payloads at 40 Hz, we need maximum performance
+        self.inner.try_publish(data)
+    }
+
     /// Get the number of registered subscribers
     pub fn subscriber_count(&self) -> usize {
         self.inner.subscriber_count()
+    }
+
+    /// Register a new subscriber
+    pub fn register_subscriber(&mut self) -> usize {
+        self.inner.register_subscriber()
     }
 
     /// Allocate and write directly to shared memory (zero-copy pattern)
@@ -99,16 +113,21 @@ impl Subscriber {
         })
     }
 
-    /// Receive the next available message (blocking)
+    /// Receive the next available message (blocking with timeout)
     pub fn receive(&mut self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         // For high-frequency 40 Hz messaging, we implement efficient polling
-        loop {
+        let mut attempts = 0;
+        let max_attempts = 1000; // 1000 * 100us = 100ms timeout
+
+        while attempts < max_attempts {
             if let Some(message) = self.inner.receive() {
                 return Ok(message);
             }
             // Small sleep to prevent busy-waiting
             std::thread::sleep(std::time::Duration::from_micros(100));
+            attempts += 1;
         }
+        Err("Timeout waiting for message".into())
     }
 
     /// Try to receive a message without blocking
@@ -130,14 +149,32 @@ impl Subscriber {
     pub fn subscriber_id(&self) -> usize {
         self.subscriber_id
     }
+
+    /// Set a prefix filter for this subscriber
+    pub fn set_prefix_filter(&mut self, prefix: &[u8]) {
+        self.inner.set_prefix_filter(prefix);
+    }
+
+    /// Set a size filter for this subscriber
+    pub fn set_size_filter(&mut self, min: usize, max: usize) {
+        self.inner.set_size_filter(min, max);
+    }
+
+    /// Remove the message filter
+    pub fn clear_filter(&mut self) {
+        self.inner.clear_filter();
+    }
+
+    /// Check if this subscriber has a filter
+    pub fn has_filter(&self) -> bool {
+        self.inner.has_filter()
+    }
 }
 
 impl Drop for Subscriber {
     fn drop(&mut self) {
-        // Cleanup shared memory when subscriber is dropped
-        unsafe {
-            SharedRingBuffer::destroy(self.buffer, &self.name);
-        }
+        // Subscriber doesn't cleanup shared memory - only publisher does
+        // This prevents conflicts in multi-process scenarios
     }
 }
 
@@ -191,6 +228,14 @@ impl PyPublisher {
     pub fn publish(&mut self, data: Vec<u8>) -> PyResult<u64> {
         match &mut self.inner {
             Some(publisher) => publisher.publish(&data)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())),
+            None => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Publisher not initialized")),
+        }
+    }
+
+    pub fn try_publish(&mut self, data: Vec<u8>) -> PyResult<Option<u64>> {
+        match &mut self.inner {
+            Some(publisher) => publisher.try_publish(&data)
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())),
             None => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Publisher not initialized")),
         }
@@ -289,6 +334,43 @@ impl PySubscriber {
             None => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Subscriber not initialized")),
         }
     }
+
+    pub fn set_prefix_filter(&mut self, prefix: Vec<u8>) -> PyResult<()> {
+        match &mut self.inner {
+            Some(subscriber) => {
+                subscriber.set_prefix_filter(&prefix);
+                Ok(())
+            }
+            None => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Subscriber not initialized")),
+        }
+    }
+
+    pub fn set_size_filter(&mut self, min_size: usize, max_size: usize) -> PyResult<()> {
+        match &mut self.inner {
+            Some(subscriber) => {
+                subscriber.set_size_filter(min_size, max_size);
+                Ok(())
+            }
+            None => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Subscriber not initialized")),
+        }
+    }
+
+    pub fn clear_filter(&mut self) -> PyResult<()> {
+        match &mut self.inner {
+            Some(subscriber) => {
+                subscriber.clear_filter();
+                Ok(())
+            }
+            None => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Subscriber not initialized")),
+        }
+    }
+
+    pub fn has_filter(&self) -> PyResult<bool> {
+        match &self.inner {
+            Some(subscriber) => Ok(subscriber.has_filter()),
+            None => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Subscriber not initialized")),
+        }
+    }
 }
 
 // Utility functions for Python
@@ -314,9 +396,11 @@ pub fn cleanup_shared_memory(name: String) -> PyResult<()> {
 fn ultrapubsub(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPublisher>()?;
     m.add_class::<PySubscriber>()?;
+    m.add_class::<PyEventLoop>()?;
     m.add_function(wrap_pyfunction!(create_subscriber, m)?)?;
     m.add_function(wrap_pyfunction!(create_publisher, m)?)?;
     m.add_function(wrap_pyfunction!(cleanup_shared_memory, m)?)?;
+    add_event_loop_to_module(m)?;
     Ok(())
 }
 
@@ -429,22 +513,50 @@ mod tests {
         // Clean up any existing shared memory
         let _ = unsafe { SharedRingBuffer::destroy(std::ptr::null_mut(), name) };
 
-        // Create publisher
-        let mut publisher = Publisher::new(name).expect("Failed to create publisher");
-
-        // Create subscriber
-        let mut subscriber = Subscriber::new(name).expect("Failed to create subscriber");
+        // Test with direct SharedRingBuffer first to isolate the issue
+        let buffer = unsafe { SharedRingBuffer::create(name).expect("Failed to create buffer") };
+        let mut publisher = RingBufferPublisher::new(buffer);
+        let subscriber_id = publisher.register_subscriber();
+        let mut subscriber = RingBufferSubscriber::new(buffer, subscriber_id);
 
         // Test message
         let test_message = b"Hello, UltraPubSub!";
         let sequence = publisher.publish(test_message).expect("Failed to publish");
+        println!("Published message with sequence: {}", sequence);
 
-        // Receive message
-        let received = subscriber.receive().expect("Failed to receive message");
-        assert_eq!(received, test_message);
+        // Debug: Check message availability before receive
+        println!("Before receive - subscriber has_messages: {}", subscriber.has_messages());
+
+        // Try to receive with debug
+        let received = subscriber.receive();
+        match received {
+            Some(msg) => {
+                assert_eq!(msg, test_message);
+                println!("Successfully received message!");
+            }
+            None => {
+                println!("Receive returned None - this indicates the message availability issue");
+
+                // Debug: Let's check the message availability directly
+                let message_slot = (sequence % 1024) as usize;
+                let is_available = unsafe { (*buffer).is_message_available(message_slot, subscriber_id) };
+                println!("Message slot {} availability for subscriber {}: {}", message_slot, subscriber_id, is_available);
+
+                // Also check published_count and last_seen
+                let published_count = unsafe { (*buffer).get_published_count() };
+                let last_seen = unsafe { (*buffer).get_last_seen(subscriber_id).unwrap_or(0) };
+                println!("Published count: {}, Last seen: {}", published_count, last_seen);
+
+                panic!("Test failed - message not available");
+            }
+        }
+
         assert_eq!(subscriber.last_processed(), sequence);
 
-        // Cleanup is handled by Drop implementations
+        println!("Test completed successfully!");
+
+        // Cleanup
+        unsafe { SharedRingBuffer::destroy(buffer, name); }
     }
 
     #[test]

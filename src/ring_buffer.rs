@@ -64,10 +64,10 @@ pub struct SharedRingBuffer {
     // Message storage
     data: [u8; BUFFER_SIZE],           // Circular buffer for message data
     offsets: [u32; MAX_MESSAGES],       // Message start offsets within data buffer
-    lengths: [u16; MAX_MESSAGES],       // Message lengths
+    lengths: [u32; MAX_MESSAGES],       // Message lengths
 
     // Synchronization and notification
-    available: AtomicU64,               // Bitmap tracking which messages are available to which subscribers
+    available: [AtomicU64; 16],         // Bitmap array tracking which messages are available to which subscribers (16 * 64 = 1024 bits)
     notification_fd: AtomicI32,         // Event file descriptor for subscriber notifications
 }
 
@@ -126,8 +126,10 @@ impl SharedRingBuffer {
                 (*ptr).lengths[i] = 0;
             }
 
-            // Initialize availability bitmap (all bits 0 = no messages available)
-            ptr::write_volatile(&mut (*ptr).available, AtomicU64::new(0));
+            // Initialize availability bitmap array (all bits 0 = no messages available)
+            for i in 0..16 {
+                ptr::write_volatile(&mut (*ptr).available[i], AtomicU64::new(0));
+            }
 
             // Initialize notification fd (-1 = none)
             ptr::write_volatile(&mut (*ptr).notification_fd, AtomicI32::new(-1));
@@ -205,35 +207,74 @@ impl SharedRingBuffer {
 
     /// Check if a specific message is available to a subscriber
     pub fn is_message_available(&self, message_id: usize, subscriber_id: usize) -> bool {
-        if message_id >= 64 || subscriber_id >= MAX_SUBSCRIBERS {
+        if subscriber_id >= MAX_SUBSCRIBERS {
             return false;
         }
 
-        let bitmap = self.available.load(Ordering::Acquire);
-        let bit_position = (message_id * MAX_SUBSCRIBERS) + subscriber_id;
+        // Calculate which bitmap word to use (each word covers 64 messages)
+        let bitmap_index = message_id / 64;
+        if bitmap_index >= 16 {
+            return false;
+        }
+
+        // Calculate bit position within the word
+        let message_in_word = message_id % 64;
+        let bit_position = (message_in_word * MAX_SUBSCRIBERS) + subscriber_id;
+
+        if bit_position >= 64 {
+            return false;
+        }
+
+        let bitmap = self.available[bitmap_index].load(Ordering::Acquire);
         (bitmap & (1 << bit_position)) != 0
     }
 
     /// Mark a message as available to a specific subscriber
     pub fn mark_message_available(&self, message_id: usize, subscriber_id: usize) {
-        if message_id >= 64 || subscriber_id >= MAX_SUBSCRIBERS {
+        if subscriber_id >= MAX_SUBSCRIBERS {
             return;
         }
 
-        let bit_position = (message_id * MAX_SUBSCRIBERS) + subscriber_id;
+        // Calculate which bitmap word to use (each word covers 64 messages)
+        let bitmap_index = message_id / 64;
+        if bitmap_index >= 16 {
+            return;
+        }
+
+        // Calculate bit position within the word
+        let message_in_word = message_id % 64;
+        let bit_position = (message_in_word * MAX_SUBSCRIBERS) + subscriber_id;
+
+        if bit_position >= 64 {
+            return;
+        }
+
         let mask = 1 << bit_position;
-        self.available.fetch_or(mask, Ordering::Release);
+        self.available[bitmap_index].fetch_or(mask, Ordering::Release);
     }
 
     /// Clear message availability for a subscriber
     pub fn clear_message_availability(&self, message_id: usize, subscriber_id: usize) {
-        if message_id >= 64 || subscriber_id >= MAX_SUBSCRIBERS {
+        if subscriber_id >= MAX_SUBSCRIBERS {
             return;
         }
 
-        let bit_position = (message_id * MAX_SUBSCRIBERS) + subscriber_id;
+        // Calculate which bitmap word to use (each word covers 64 messages)
+        let bitmap_index = message_id / 64;
+        if bitmap_index >= 16 {
+            return;
+        }
+
+        // Calculate bit position within the word
+        let message_in_word = message_id % 64;
+        let bit_position = (message_in_word * MAX_SUBSCRIBERS) + subscriber_id;
+
+        if bit_position >= 64 {
+            return;
+        }
+
         let mask = !(1 << bit_position);
-        self.available.fetch_and(mask, Ordering::Release);
+        self.available[bitmap_index].fetch_and(mask, Ordering::Release);
     }
 
     /// Set the notification file descriptor
@@ -280,6 +321,7 @@ impl RingBufferPublisher {
             return Err("Message too large for buffer".into());
         }
 
+        
         unsafe {
             let buffer = &*self.buffer;
 
@@ -287,10 +329,18 @@ impl RingBufferPublisher {
             let head = buffer.get_head();
             let next_head = head + data.len() as u64;
 
-            // Check if we have enough space (simple wrap-around check)
-            if next_head > BUFFER_SIZE as u64 {
-                // For now, reject if we can't fit without wrapping
-                // TODO: Implement proper circular buffer wrap-around
+            // Check if we have enough space, considering wrap-around
+            let available_space = if next_head > BUFFER_SIZE as u64 {
+                // Message wraps around - need space from head to end and from start to needed position
+                let space_at_end = BUFFER_SIZE as u64 - head;
+                let space_needed_at_start = next_head - BUFFER_SIZE as u64;
+                space_at_end + space_needed_at_start
+            } else {
+                // Message fits without wrapping
+                BUFFER_SIZE as u64 - head
+            };
+
+            if available_space < data.len() as u64 {
                 return Err("Insufficient space in buffer".into());
             }
 
@@ -298,24 +348,40 @@ impl RingBufferPublisher {
             let sequence = buffer.get_published_count();
             let message_slot = (sequence % MAX_MESSAGES as u64) as usize;
 
-            // Copy message data to the buffer
-            let data_ptr = buffer.data.as_ptr().add(head as usize);
-            ptr::copy_nonoverlapping(data.as_ptr(), data_ptr as *mut u8, data.len());
+            // Copy message data to the buffer with wrap-around support
+            if next_head <= BUFFER_SIZE as u64 {
+                // Message fits without wrapping - single copy
+                let data_ptr = buffer.data.as_ptr().add(head as usize);
+                ptr::copy_nonoverlapping(data.as_ptr(), data_ptr as *mut u8, data.len());
+            } else {
+                // Message wraps around - split into two copies
+                let space_at_end = BUFFER_SIZE as u64 - head;
+                let space_at_start = data.len() as u64 - space_at_end;
+
+                // Copy first part to end of buffer
+                let end_ptr = buffer.data.as_ptr().add(head as usize);
+                ptr::copy_nonoverlapping(data.as_ptr(), end_ptr as *mut u8, space_at_end as usize);
+
+                // Copy second part to start of buffer
+                let start_ptr = buffer.data.as_ptr();
+                ptr::copy_nonoverlapping(data.as_ptr().add(space_at_end as usize), start_ptr as *mut u8, space_at_start as usize);
+            }
 
             // Update message metadata (need to cast to mutable pointer)
             let buffer_mut = buffer as *const SharedRingBuffer as *mut SharedRingBuffer;
             unsafe {
                 (*buffer_mut).offsets[message_slot] = head as u32;
-                (*buffer_mut).lengths[message_slot] = data.len() as u16;
+                (*buffer_mut).lengths[message_slot] = data.len() as u32;
             }
 
             // Mark message as available for all subscribers
             for subscriber_id in 0..self.subscriber_count.max(1) {
-                buffer.mark_message_available(message_slot, subscriber_id);
+                buffer.mark_message_available(sequence as usize, subscriber_id);
             }
 
-            // Update publisher state
-            buffer.head.store(next_head, Ordering::Release);
+            // Update publisher state with wrap-around
+            let wrapped_next_head = next_head % BUFFER_SIZE as u64;
+            buffer.head.store(wrapped_next_head, Ordering::Release);
             buffer.published_count.store(sequence + 1, Ordering::Release);
 
             // Notify subscribers if notification fd is set
@@ -326,7 +392,93 @@ impl RingBufferPublisher {
                 libc::write(notify_fd, &notification_data as *const u64 as *const c_void, 8);
             }
 
+            
             Ok(sequence)
+        }
+    }
+
+    /// Try to publish without blocking - returns None if buffer is full
+    pub fn try_publish(&mut self, data: &[u8]) -> Result<Option<u64>, Box<dyn std::error::Error>> {
+        if data.is_empty() {
+            return Err("Message data cannot be empty".into());
+        }
+
+        if data.len() > BUFFER_SIZE {
+            return Err("Message too large for buffer".into());
+        }
+
+        unsafe {
+            let buffer = &*self.buffer;
+
+            // Get current head and calculate next position
+            let head = buffer.get_head();
+            let next_head = head + data.len() as u64;
+
+            // Check if we have enough space, considering wrap-around
+            let available_space = if next_head > BUFFER_SIZE as u64 {
+                // Message wraps around - need space from head to end and from start to needed position
+                let space_at_end = BUFFER_SIZE as u64 - head;
+                let space_needed_at_start = next_head - BUFFER_SIZE as u64;
+                space_at_end + space_needed_at_start
+            } else {
+                // Message fits without wrapping
+                BUFFER_SIZE as u64 - head
+            };
+
+            // Return None if not enough space (non-blocking behavior)
+            if available_space < data.len() as u64 {
+                return Ok(None);
+            }
+
+            // Get the next message sequence number
+            let sequence = buffer.get_published_count();
+            let message_slot = (sequence % MAX_MESSAGES as u64) as usize;
+
+            // Copy message data to the buffer with wrap-around support
+            if next_head <= BUFFER_SIZE as u64 {
+                // Message fits without wrapping - single copy
+                let data_ptr = buffer.data.as_ptr().add(head as usize);
+                ptr::copy_nonoverlapping(data.as_ptr(), data_ptr as *mut u8, data.len());
+            } else {
+                // Message wraps around - split into two copies
+                let space_at_end = BUFFER_SIZE as u64 - head;
+                let space_at_start = data.len() as u64 - space_at_end;
+
+                // Copy first part to end of buffer
+                let end_ptr = buffer.data.as_ptr().add(head as usize);
+                ptr::copy_nonoverlapping(data.as_ptr(), end_ptr as *mut u8, space_at_end as usize);
+
+                // Copy second part to start of buffer
+                let start_ptr = buffer.data.as_ptr();
+                ptr::copy_nonoverlapping(data.as_ptr().add(space_at_end as usize), start_ptr as *mut u8, space_at_start as usize);
+            }
+
+            // Update message metadata (need to cast to mutable pointer)
+            let buffer_mut = buffer as *const SharedRingBuffer as *mut SharedRingBuffer;
+            unsafe {
+                (*buffer_mut).offsets[message_slot] = head as u32;
+                (*buffer_mut).lengths[message_slot] = data.len() as u32;
+            }
+
+            // Mark message as available for all subscribers
+            for subscriber_id in 0..self.subscriber_count.max(1) {
+                buffer.mark_message_available(sequence as usize, subscriber_id);
+            }
+
+            // Update publisher state with wrap-around
+            let wrapped_next_head = next_head % BUFFER_SIZE as u64;
+            buffer.head.store(wrapped_next_head, Ordering::Release);
+            buffer.published_count.store(sequence + 1, Ordering::Release);
+
+            // Notify subscribers if notification fd is set
+            let notify_fd = buffer.get_notification_fd();
+            if notify_fd != -1 {
+                // Simple notification - write 1 byte to eventfd
+                let notification_data = 1u64;
+                libc::write(notify_fd, &notification_data as *const u64 as *const c_void, 8);
+            }
+
+            Ok(Some(sequence))
         }
     }
 
@@ -347,11 +499,38 @@ impl RingBufferPublisher {
     }
 }
 
+/// Message filter types
+#[derive(Clone, Copy)]
+pub enum MessageFilter {
+    Prefix { prefix: [u8; 32], prefix_len: usize },
+    SizeRange { min: usize, max: usize },
+    None,
+}
+
+impl MessageFilter {
+    pub fn apply(&self, data: &[u8]) -> bool {
+        match self {
+            MessageFilter::Prefix { prefix, prefix_len } => {
+                if data.len() < *prefix_len {
+                    return false;
+                }
+                data.starts_with(&prefix[..*prefix_len])
+            }
+            MessageFilter::SizeRange { min, max } => {
+                let len = data.len();
+                len >= *min && len <= *max
+            }
+            MessageFilter::None => true,
+        }
+    }
+}
+
 /// Subscriber for the shared memory ring buffer
 pub struct RingBufferSubscriber {
     buffer: *mut SharedRingBuffer,
     subscriber_id: usize,
     last_processed: u64,
+    filter: MessageFilter,
 }
 
 impl RingBufferSubscriber {
@@ -360,8 +539,32 @@ impl RingBufferSubscriber {
         Self {
             buffer,
             subscriber_id,
-            last_processed: 0,
+            last_processed: u64::MAX, // Special value indicating no messages processed yet
+            filter: MessageFilter::None,
         }
+    }
+
+    /// Set a prefix filter for this subscriber
+    pub fn set_prefix_filter(&mut self, prefix: &[u8]) {
+        let mut prefix_array = [0u8; 32];
+        let prefix_len = prefix.len().min(32);
+        prefix_array[..prefix_len].copy_from_slice(&prefix[..prefix_len]);
+        self.filter = MessageFilter::Prefix { prefix: prefix_array, prefix_len };
+    }
+
+    /// Set a size filter for this subscriber
+    pub fn set_size_filter(&mut self, min: usize, max: usize) {
+        self.filter = MessageFilter::SizeRange { min, max };
+    }
+
+    /// Remove the message filter
+    pub fn clear_filter(&mut self) {
+        self.filter = MessageFilter::None;
+    }
+
+    /// Check if this subscriber has a filter
+    pub fn has_filter(&self) -> bool {
+        !matches!(self.filter, MessageFilter::None)
     }
 
     /// Receive the next available message
@@ -379,26 +582,57 @@ impl RingBufferSubscriber {
             }
 
             // Look for the next available message
-            for sequence in (last_seen + 1)..=published_count {
+            // We need to check all sequence numbers that might be available
+            let start_seq = last_seen;
+            let end_seq = published_count.saturating_sub(1);
+
+            
+            // But skip sequences we've already processed
+            for sequence in start_seq..=end_seq {
+                if self.last_processed != u64::MAX && sequence <= self.last_processed {
+                    continue;
+                }
                 let message_slot = (sequence % MAX_MESSAGES as u64) as usize;
 
                 if buffer.is_message_available(message_slot, self.subscriber_id) {
+
                     // Get message metadata
                     let offset = buffer.offsets[message_slot] as usize;
                     let length = buffer.lengths[message_slot] as usize;
 
-                    // Copy message data
-                    let data_ptr = buffer.data.as_ptr().add(offset);
+                    // Copy message data with wrap-around support
                     let mut message_data = Vec::with_capacity(length);
-                    ptr::copy_nonoverlapping(data_ptr, message_data.as_mut_ptr(), length);
+                    if offset + length <= BUFFER_SIZE {
+                        // Message is contiguous - single copy
+                        let data_ptr = buffer.data.as_ptr().add(offset);
+                        ptr::copy_nonoverlapping(data_ptr, message_data.as_mut_ptr(), length);
+                    } else {
+                        // Message wraps around - split into two copies
+                        let space_at_end = BUFFER_SIZE - offset;
+                        let space_at_start = length - space_at_end;
+
+                        // Copy first part from end of buffer
+                        let end_ptr = buffer.data.as_ptr().add(offset);
+                        ptr::copy_nonoverlapping(end_ptr, message_data.as_mut_ptr(), space_at_end);
+
+                        // Copy second part from start of buffer
+                        let start_ptr = buffer.data.as_ptr();
+                        ptr::copy_nonoverlapping(start_ptr, message_data.as_mut_ptr().add(space_at_end), space_at_start);
+                    }
                     message_data.set_len(length);
+
+                    // Apply filter if one is set
+                    if !self.filter.apply(&message_data) {
+                        // Skip this message - continue to next one
+                        continue;
+                    }
 
                     // Update our state
                     buffer.last_seen[self.subscriber_id].store(sequence, Ordering::Release);
                     self.last_processed = sequence;
 
                     // Clear availability for this message
-                    buffer.clear_message_availability(message_slot, self.subscriber_id);
+                    buffer.clear_message_availability(sequence as usize, self.subscriber_id);
 
                     return Some(message_data);
                 }

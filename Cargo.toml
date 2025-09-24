@@ -13,5 +13,5 @@ pyo3 = { version = "0.26", features = ["extension-module"] }
 pyo3-ffi = "0.26"
 libc = "0.2.176"
 memmap2 = "0.9.8"
-nix = { version = "0.29", features = ["fs", "mman", "process"] }
+nix = { version = "0.29", features = ["fs", "mman", "process", "event"] }
 fcntl = "0.1"

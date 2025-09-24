@@ -9,29 +9,25 @@ import os
 import sys
 import multiprocessing
 from typing import Optional, Callable, Any
-from .ultrapubsub import PyHring, PyPublisher, PySubscriber
+from .ultrapubsub import PyPublisher, PySubscriber
 
 
 class SharedMemory:
     """
-    High-level wrapper for shared memory management using Hring.
+    High-level wrapper for shared memory management using Ring Buffer.
 
     This class provides a simplified interface for creating and managing
     shared memory regions for inter-process communication.
     """
 
-    def __init__(self, name: str, entries: int = 32, flags: int = 0, sq_thread_cpu: int = 0):
+    def __init__(self, name: str):
         """
         Initialize a new shared memory region.
 
         Args:
             name: Unique name for the shared memory region
-            entries: Number of entries in the io_uring ring (default: 32)
-            flags: io_uring setup flags (default: 0)
-            sq_thread_cpu: CPU for SQ thread (default: 0)
         """
         self.name = name
-        self.hring = PyHring(name, entries, flags, sq_thread_cpu)
         self._publisher = None
         self._subscriber = None
 
@@ -48,7 +44,6 @@ class SharedMemory:
         """
         instance = cls.__new__(cls)
         instance.name = name
-        instance.hring = PyHring.attach(name)
         instance._publisher = None
         instance._subscriber = None
         return instance
@@ -61,7 +56,7 @@ class SharedMemory:
             Publisher instance
         """
         if self._publisher is None:
-            self._publisher = Publisher(self.hring)
+            self._publisher = Publisher(self.name)
         return self._publisher
 
     def create_subscriber(self) -> 'Subscriber':
@@ -72,7 +67,7 @@ class SharedMemory:
             Subscriber instance
         """
         if self._subscriber is None:
-            self._subscriber = Subscriber(self.hring)
+            self._subscriber = Subscriber(self.name)
         return self._subscriber
 
 
@@ -84,21 +79,25 @@ class Publisher:
     to subscribers through shared memory.
     """
 
-    def __init__(self, hring: PyHring):
+    def __init__(self, name: str):
         """
-        Initialize publisher with an existing Hring.
+        Initialize publisher with a shared memory name.
 
         Args:
-            hring: PyHring instance for shared memory access
+            name: Name for the shared memory region
         """
-        self._publisher = PyPublisher(hring)
+        self._publisher = PyPublisher(name)
+        self._publisher.initialize()
 
-    def publish(self, data: bytes) -> None:
+    def publish(self, data: bytes) -> int:
         """
         Publish data to shared memory.
 
         Args:
             data: Bytes data to publish
+
+        Returns:
+            Sequence number of the published message
 
         Raises:
             RuntimeError: If publishing fails
@@ -106,7 +105,26 @@ class Publisher:
         if not isinstance(data, bytes):
             raise TypeError("Data must be bytes")
 
-        self._publisher.publish(data)
+        return self._publisher.publish(data)
+
+    def try_publish(self, data: bytes) -> bool:
+        """
+        Try to publish data to shared memory without blocking.
+
+        Args:
+            data: Bytes data to publish
+
+        Returns:
+            True if published successfully, False if buffer is full
+
+        Raises:
+            RuntimeError: If publishing fails for reasons other than full buffer
+        """
+        if not isinstance(data, bytes):
+            raise TypeError("Data must be bytes")
+
+        result = self._publisher.try_publish(data)
+        return result is not None
 
     def publish_string(self, text: str, encoding: str = 'utf-8') -> None:
         """
@@ -201,14 +219,15 @@ class Subscriber:
     from publishers through shared memory.
     """
 
-    def __init__(self, hring: PyHring):
+    def __init__(self, name: str):
         """
-        Initialize subscriber with an existing Hring.
+        Initialize subscriber with a shared memory name.
 
         Args:
-            hring: PyHring instance for shared memory access
+            name: Name for the shared memory region
         """
-        self._subscriber = PySubscriber(hring)
+        self._subscriber = PySubscriber(name)
+        self._subscriber.initialize()
 
     def receive(self, timeout: Optional[float] = None) -> Optional[bytes]:
         """
@@ -225,7 +244,7 @@ class Subscriber:
         import time
         start_time = time.time()
 
-        
+
         # Use blocking event-driven behavior with timeout
         while True:
             # Try non-blocking receive first
@@ -244,6 +263,52 @@ class Subscriber:
             time.sleep(0.001)  # 1ms sleep
 
         return None
+
+    def try_receive(self) -> Optional[bytes]:
+        """
+        Try to receive a message without blocking.
+
+        Returns:
+            Received data as bytes, or None if no message available
+        """
+        try:
+            return self._subscriber.try_receive()
+        except Exception:
+            return None
+
+    def set_prefix_filter(self, prefix: bytes) -> None:
+        """
+        Set a prefix filter for messages.
+
+        Args:
+            prefix: Only messages starting with this prefix will be received
+        """
+        self._subscriber.set_prefix_filter(prefix)
+
+    def set_size_filter(self, min_size: int, max_size: int) -> None:
+        """
+        Set a size filter for messages.
+
+        Args:
+            min_size: Minimum message size in bytes
+            max_size: Maximum message size in bytes
+        """
+        self._subscriber.set_size_filter(min_size, max_size)
+
+    def clear_filter(self) -> None:
+        """
+        Remove any active message filter.
+        """
+        self._subscriber.clear_filter()
+
+    def has_filter(self) -> bool:
+        """
+        Check if this subscriber has an active filter.
+
+        Returns:
+            True if a filter is active, False otherwise
+        """
+        return self._subscriber.has_filter()
 
     def receive_string(self, timeout: Optional[float] = None, encoding: str = 'utf-8') -> Optional[str]:
         """
