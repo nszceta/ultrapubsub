@@ -1,0 +1,279 @@
+name: Performance Tests
+
+on:
+  push:
+    branches: [ main, dev ]
+  pull_request:
+    branches: [ main, dev ]
+  schedule:
+    # Run performance tests daily at 2 AM UTC
+    - cron: '0 2 * * *'
+
+jobs:
+  performance-test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        test-config:
+          - name: "Quick Test"
+            duration: 10
+            frequency: 20
+            subscribers: 3
+            message-size: 1048576  # 1MB
+          - name: "Standard Test"
+            duration: 30
+            frequency: 40
+            subscribers: 6
+            message-size: 20971520  # 20MB
+          - name: "Stress Test"
+            duration: 60
+            frequency: 60
+            subscribers: 10
+            message-size: 20971520  # 20MB
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e .
+        pip install psutil pytest pytest-benchmark
+
+    - name: Run performance test
+      run: |
+        python tests/performance/run_performance_test.py \
+          --duration ${{ matrix.test-config.duration }} \
+          --frequency ${{ matrix.test-config.frequency }} \
+          --subscribers ${{ matrix.test-config.subscribers }} \
+          --message-size ${{ matrix.test-config.message-size }} \
+          --output-dir performance-results \
+          --save-config performance-config-${{ matrix.test-config.name }}.json
+
+    - name: Upload performance results
+      uses: actions/upload-artifact@v3
+      with:
+        name: performance-results-${{ matrix.test-config.name }}
+        path: performance-results/
+
+    - name: Validate performance metrics
+      run: |
+        python -c "
+        import json
+        import sys
+        import glob
+
+        # Find the latest performance test result
+        result_files = glob.glob('performance-results/performance_test_*.json')
+        if not result_files:
+            print('No performance test results found')
+            sys.exit(1)
+
+        latest_file = max(result_files)
+        with open(latest_file, 'r') as f:
+            results = json.load(f)
+
+        # Extract metrics
+        metrics = results['metrics']
+        throughput = metrics['throughput_mbps']
+        messages_sent = metrics['messages_sent']
+        duration = metrics['end_time'] - metrics['start_time']
+
+        print(f'Performance Test Results:')
+        print(f'  Duration: {duration:.2f}s')
+        print(f'  Messages sent: {messages_sent}')
+        print(f'  Throughput: {throughput:.2f} MB/s')
+
+        # Basic validation
+        if messages_sent == 0:
+            print('ERROR: No messages were sent')
+            sys.exit(1)
+
+        if throughput < 1.0:  # At least 1 MB/s
+            print(f'ERROR: Throughput too low: {throughput:.2f} MB/s')
+            sys.exit(1)
+
+        print('Performance test validation passed')
+        "
+
+  performance-regression:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Fetch full history for comparison
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e .
+        pip install psutil pytest pytest-benchmark
+
+    - name: Run baseline performance test (main branch)
+      if: github.event_name == 'pull_request'
+      run: |
+        git checkout main
+        python tests/performance/run_performance_test.py \
+          --duration 15 \
+          --frequency 40 \
+          --subscribers 6 \
+          --message-size 20971520 \
+          --output-dir baseline-results
+
+    - name: Run current branch performance test
+      run: |
+        git checkout ${{ github.sha }}
+        python tests/performance/run_performance_test.py \
+          --duration 15 \
+          --frequency 40 \
+          --subscribers 6 \
+          --message-size 20971520 \
+          --output-dir current-results
+
+    - name: Compare performance results
+      run: |
+        python -c "
+        import json
+        import glob
+        import sys
+
+        # Load baseline results
+        baseline_files = glob.glob('baseline-results/performance_test_*.json')
+        current_files = glob.glob('current-results/performance_test_*.json')
+
+        if not baseline_files or not current_files:
+            print('ERROR: Could not find performance test results')
+            sys.exit(1)
+
+        baseline_file = max(baseline_files)
+        current_file = max(current_files)
+
+        with open(baseline_file, 'r') as f:
+            baseline = json.load(f)
+
+        with open(current_file, 'r') as f:
+            current = json.load(f)
+
+        # Extract metrics
+        baseline_throughput = baseline['metrics']['throughput_mbps']
+        current_throughput = current['metrics']['throughput_mbps']
+
+        baseline_latency = baseline['metrics']['latency_samples']
+        current_latency = current['metrics']['latency_samples']
+
+        print(f'Performance Regression Analysis:')
+        print(f'  Baseline throughput: {baseline_throughput:.2f} MB/s')
+        print(f'  Current throughput: {current_throughput:.2f} MB/s')
+
+        if baseline_latency and current_latency:
+            baseline_avg_latency = sum(baseline_latency) / len(baseline_latency)
+            current_avg_latency = sum(current_latency) / len(current_latency)
+            print(f'  Baseline latency: {baseline_avg_latency:.2f} ms')
+            print(f'  Current latency: {current_avg_latency:.2f} ms')
+
+        # Check for regressions
+        throughput_change = (current_throughput - baseline_throughput) / baseline_throughput * 100
+
+        print(f'  Throughput change: {throughput_change:+.2f}%')
+
+        # Fail if throughput degraded by more than 10%
+        if throughput_change < -10:
+            print(f'ERROR: Significant performance regression detected ({throughput_change:.2f}%)')
+            sys.exit(1)
+
+        print('Performance regression check passed')
+        "
+
+  nightly-performance:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e .
+        pip install psutil pytest pytest-benchmark
+
+    - name: Run extended performance test
+      run: |
+        python tests/performance/run_performance_test.py \
+          --duration 300 \  # 5 minutes
+          --frequency 40 \
+          --subscribers 6 \
+          --message-size 20971520 \
+          --output-dir nightly-results
+
+    - name: Generate performance report
+      run: |
+        python -c "
+        import json
+        import glob
+        from datetime import datetime
+
+        # Load the latest performance test result
+        result_files = glob.glob('nightly-results/performance_test_*.json')
+        if not result_files:
+            print('No performance test results found')
+            exit(1)
+
+        latest_file = max(result_files)
+        with open(latest_file, 'r') as f:
+            results = json.load(f)
+
+        # Generate report
+        metrics = results['metrics']
+        config = results['config']['config']
+
+        report = f'''# Nightly Performance Report
+Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+## Test Configuration
+- Duration: {config['test_duration_seconds']}s
+- Frequency: {config['frequency_hz']}Hz
+- Subscribers: {config['subscriber_count']}
+- Message Size: {config['message_size_bytes'] / 1024 / 1024:.1f}MB
+
+## Performance Metrics
+- Messages Sent: {metrics['messages_sent']}
+- Throughput: {metrics['throughput_mbps']:.2f} MB/s
+- Target Throughput: {config['message_size_bytes'] * config['frequency_hz'] / 1024 / 1024:.2f} MB/s
+- Test Duration: {metrics['end_time'] - metrics['start_time']:.2f}s
+
+## System Resources
+{json.dumps(metrics.get('resource_usage', {}), indent=2)}
+
+## Error Summary
+Errors: {len(metrics['errors'])}
+'''
+
+        with open('nightly-results/performance-report.md', 'w') as f:
+            f.write(report)
+
+        print('Performance report generated')
+        "
+
+    - name: Upload nightly results
+      uses: actions/upload-artifact@v3
+      with:
+        name: nightly-performance-results
+        path: nightly-results/

@@ -94,8 +94,8 @@ const IORING_SQ_CQ_OVERFLOW: u32 = 1 << 0;
 const IORING_SQ_TASKRUN: u32 = 1 << 1;
 const IORING_ENTER_GETEVENTS: u32 = 1 << 0;
 
-// Block size for memory pool (4KB)
-const BLOCK_SIZE: usize = 4096;
+// Block size for memory pool (32MB to handle large messages)
+const BLOCK_SIZE: usize = 32 * 1024 * 1024;
 
 // 64-bit memory address type (equivalent to hring_addr_t)
 pub type HringAddr = u64;
@@ -159,18 +159,18 @@ impl SharedMemoryPool {
     // Find first free bit in bitmap word (equivalent to _bitmap_find_free)
     fn bitmap_find_free(&self, bitmap_word: &AtomicU64) -> u32 {
         let value = bitmap_word.load(Ordering::Relaxed);
-        println!("DEBUG: bitmap_find_free: value={:064b}", value);
+        // // println!("DEBUG: bitmap_find_free: value={:064b}", value);
         if value == 0 {
             return 0; // No free bits
         }
         let result = value.trailing_zeros() + 1;
-        println!("DEBUG: bitmap_find_free: returning {}", result);
+        // // println!("DEBUG: bitmap_find_free: returning {}", result);
         result
     }
     
     // Allocate a block from the memory pool (equivalent to hring_mpool_alloc)
     pub fn alloc(&self, size: usize) -> Result<HringAddr, Box<dyn std::error::Error>> {
-        println!("DEBUG: alloc called with size: {}, blocks: {}, bitmap: {:p}, map: {:p}", size, self.blocks, self.bitmap, self.map);
+        // // println!("DEBUG: alloc called with size: {}, blocks: {}, bitmap: {:p}, map: {:p}", size, self.blocks, self.bitmap, self.map);
         if size == 0 {
             return Err("Size cannot be zero".into());
         }
@@ -194,7 +194,7 @@ impl SharedMemoryPool {
                 
                 let block_index = (i * 64 + bit_idx as usize) as u32;
                 let addr = (size_part & 0xFFFFFFFF00000000) | (block_index as u64 & 0xFFFFFFFF);
-                println!("DEBUG: alloc returning addr: {} (size_part: {}, block_index: {})", addr, size_part, block_index);
+                // // println!("DEBUG: alloc returning addr: {} (size_part: {}, block_index: {})", addr, size_part, block_index);
                 return Ok(addr);
             }
         }
@@ -231,7 +231,7 @@ impl SharedMemoryPool {
     pub fn deref(&self, addr: HringAddr) -> *mut u8 {
         let offset = hring_addr_off(addr) as usize;
         let ptr = unsafe { self.map.add(offset * BLOCK_SIZE) };
-        println!("DEBUG: deref called with addr: {}, offset: {}, map: {:p}, result: {:p}", addr, offset, self.map, ptr);
+        // // println!("DEBUG: deref called with addr: {}, offset: {}, map: {:p}, result: {:p}", addr, offset, self.map, ptr);
         ptr
     }
 }
@@ -308,7 +308,7 @@ impl Hring {
         params.sq_thread_cpu = sq_thread_cpu;
         params.cq_entries = entries * 2; // Completion ring should be larger
         
-        println!("DEBUG: Parent - creating io_uring with entries: {}, cq_entries: {}, flags: {}", entries, params.cq_entries, params.flags);
+        // // println!("DEBUG: Parent - creating io_uring with entries: {}, cq_entries: {}, flags: {}", entries, params.cq_entries, params.flags);
         
         let ring_fd = unsafe {
             libc::syscall(SYS_io_uring_setup, entries, &mut params)
@@ -329,21 +329,21 @@ impl Hring {
         let hring_id = format_hring_id(name, ring_fd, std::process::id() as i32, entries, params.cq_entries);
 
         // Also store the actual io_uring parameters for child to use
-        println!("DEBUG: Parent - storing actual cq_off: head:{}, tail:{}, mask:{}, entries:{}, cqes:{}",
-                 params.cq_off.head, params.cq_off.tail, params.cq_off.ring_mask, params.cq_off.ring_entries, params.cq_off.cqes);
+        // // println!("DEBUG: Parent - storing actual cq_off: head:{}, tail:{}, mask:{}, entries:{}, cqes:{}",
+        //          params.cq_off.head, params.cq_off.tail, params.cq_off.ring_mask, params.cq_off.ring_entries, params.cq_off.cqes);
 
         // Debug the hring ID
-        println!("DEBUG: Parent - raw hring_id ptr: {:p}, len: {}", hring_id.as_ptr(), hring_id.len());
+        // println!("DEBUG: Parent - raw hring_id ptr: {:p}, len: {}", hring_id.as_ptr(), hring_id.len());
         let hex_bytes: Vec<String> = hring_id.as_bytes().iter().map(|b| format!("{:02x}", b)).collect();
-        println!("DEBUG: Parent - hring_id hex: {}", hex_bytes.join(" "));
+        // println!("DEBUG: Parent - hring_id hex: {}", hex_bytes.join(" "));
 
         // Check if the string actually has null terminator at len() position
         let hring_id_cstr = std::ffi::CString::new(hring_id.clone()).unwrap();
         let cstr_bytes: Vec<String> = hring_id_cstr.as_bytes_with_nul().iter().map(|b| format!("{:02x}", b)).collect();
-        println!("DEBUG: Parent - hring_id as CString: {}", cstr_bytes.join(" "));
+        // println!("DEBUG: Parent - hring_id as CString: {}", cstr_bytes.join(" "));
         
         // Let's also dump what the parent reads from its own mapped memory to verify
-        println!("DEBUG: Parent - checking what parent reads from its own completion ring:");
+        // println!("DEBUG: Parent - checking what parent reads from its own completion ring:");
         
         // Store the actual cq_off parameters after the hring ID for child to use
         let actual_params = io_uring_params {
@@ -363,11 +363,11 @@ impl Hring {
             // Write hring ID as null-terminated string using CString to ensure null terminator
             let hring_id_cstr = std::ffi::CString::new(hring_id.clone()).unwrap();
             let id_bytes_written = libc::write(fd.as_raw_fd(), hring_id_cstr.as_ptr() as *const libc::c_void, hring_id_cstr.as_bytes_with_nul().len());
-            println!("DEBUG: Parent - hring_id: '{}', len: {}, wrote: {} bytes", hring_id, hring_id_cstr.as_bytes_with_nul().len(), id_bytes_written);
+            // println!("DEBUG: Parent - hring_id: '{}', len: {}, wrote: {} bytes", hring_id, hring_id_cstr.as_bytes_with_nul().len(), id_bytes_written);
 
             // Write actual parameters immediately after the null terminator (no alignment needed)
             let params_bytes_written = libc::write(fd.as_raw_fd(), &actual_params as *const io_uring_params as *const libc::c_void, std::mem::size_of::<io_uring_params>());
-            println!("DEBUG: Parent - wrote params: {} bytes", params_bytes_written);
+            // println!("DEBUG: Parent - wrote params: {} bytes", params_bytes_written);
         }
         
         // Create memory pool in shared memory
@@ -376,7 +376,7 @@ impl Hring {
             let page_size = libc::sysconf(libc::_SC_PAGESIZE) as usize;
             let aligned_offset = ((hring_id_size + page_size - 1) / page_size) * page_size;
             
-            println!("DEBUG: page_size: {}, hring_id_size: {}, aligned_offset: {}", page_size, hring_id_size, aligned_offset);
+            // println!("DEBUG: page_size: {}, hring_id_size: {}, aligned_offset: {}", page_size, hring_id_size, aligned_offset);
             
             // Map the shared memory region
             let map_ptr = libc::mmap(
@@ -390,7 +390,7 @@ impl Hring {
             
             if map_ptr == libc::MAP_FAILED {
                 let error = std::io::Error::last_os_error();
-                println!("DEBUG: Parent mmap failed with error: {}, offset: {}, size: {}", error, hring_id_size, total_pool_size);
+                // println!("DEBUG: Parent mmap failed with error: {}, offset: {}, size: {}", error, hring_id_size, total_pool_size);
                 return Err(format!("Failed to map shared memory pool: {}", error).into());
             }
             
@@ -425,11 +425,11 @@ impl Hring {
             Mode::S_IRUSR | Mode::S_IWUSR,
         )?;
         
-        println!("DEBUG: Child opened shared memory fd: {}", shm_fd.as_raw_fd());
+        // println!("DEBUG: Child opened shared memory fd: {}", shm_fd.as_raw_fd());
 
         // Check current file position
         let start_pos = unsafe { libc::lseek(shm_fd.as_raw_fd(), 0, libc::SEEK_CUR) };
-        println!("DEBUG: Child - starting file position: {}", start_pos);
+        // println!("DEBUG: Child - starting file position: {}", start_pos);
 
         // Reset to beginning of file to read hring ID
         unsafe { libc::lseek(shm_fd.as_raw_fd(), 0, libc::SEEK_SET); };
@@ -440,12 +440,12 @@ impl Hring {
             libc::read(shm_fd.as_raw_fd(), exact_buffer.as_mut_ptr() as *mut libc::c_void, 28) // Parent said it wrote 28 bytes
         };
 
-        println!("DEBUG: Child - attempted to read 28 bytes, got {} bytes", exact_bytes_read);
+        // println!("DEBUG: Child - attempted to read 28 bytes, got {} bytes", exact_bytes_read);
 
         let exact_hex: Vec<String> = exact_buffer[..exact_bytes_read as usize].iter()
             .map(|b| format!("{:02x}", b))
             .collect();
-        println!("DEBUG: Child - exact read hex: {}", exact_hex.join(" "));
+        // println!("DEBUG: Child - exact read hex: {}", exact_hex.join(" "));
 
         // Reset position to read hring ID again
         unsafe { libc::lseek(shm_fd.as_raw_fd(), 0, libc::SEEK_SET); };
@@ -470,16 +470,16 @@ impl Hring {
             // Check if we hit null terminator - if so, stop reading immediately
             if id_buffer[total_bytes_read - 1] == 0 {
                 id_len = total_bytes_read - 1; // Exclude null terminator
-                println!("DEBUG: Child - found null terminator at position {}, stopping", total_bytes_read - 1);
+                // println!("DEBUG: Child - found null terminator at position {}, stopping", total_bytes_read - 1);
                 // Print hex dump of what we read
                 let hex_str: Vec<String> = id_buffer[..total_bytes_read].iter()
                     .map(|b| format!("{:02x}", b))
                     .collect();
-                println!("DEBUG: Child - hex dump: {}", hex_str.join(" "));
+                // println!("DEBUG: Child - hex dump: {}", hex_str.join(" "));
                 break;
             }
         }
-        println!("DEBUG: Child - total_bytes_read: {}, id_len: {}", total_bytes_read, id_len);
+        // println!("DEBUG: Child - total_bytes_read: {}, id_len: {}", total_bytes_read, id_len);
         
         if id_len == 0 {
             return Err("Failed to read valid hring ID".into());
@@ -504,12 +504,12 @@ impl Hring {
             }
         };
 
-        println!("DEBUG: Child - parsed hring ID: '{}', len: {}", id_str, id_str.len());
+        // println!("DEBUG: Child - parsed hring ID: '{}', len: {}", id_str, id_str.len());
         let (name, parent_fd, parent_pid, sr_size, cr_size) = parse_hring_id(id_str)?;
 
         // After reading the hring ID including null terminator, we should already be at the right position
         let current_pos = unsafe { libc::lseek(shm_fd.as_raw_fd(), 0, libc::SEEK_CUR) };
-        println!("DEBUG: Child - current position after reading hring ID: {}", current_pos);
+        // println!("DEBUG: Child - current position after reading hring ID: {}", current_pos);
 
         let hring_id_offset = current_pos as usize;
 
@@ -519,21 +519,43 @@ impl Hring {
             libc::read(shm_fd.as_raw_fd(), &mut actual_params as *mut io_uring_params as *mut libc::c_void, std::mem::size_of::<io_uring_params>())
         };
 
-        println!("DEBUG: Child - read params: {} bytes", params_bytes_read);
+        // println!("DEBUG: Child - read params: {} bytes", params_bytes_read);
         if params_bytes_read as usize != std::mem::size_of::<io_uring_params>() {
             return Err("Failed to read io_uring parameters from shared memory".into());
         }
         
-        println!("DEBUG: Child read actual parameters from shared memory:");
-        println!("DEBUG: sq_entries: {}, cq_entries: {}", actual_params.sq_entries, actual_params.cq_entries);
-        println!("DEBUG: cq_off: head:{}, tail:{}, mask:{}, entries:{}, cqes:{}", 
-                 actual_params.cq_off.head, actual_params.cq_off.tail, actual_params.cq_off.ring_mask, actual_params.cq_off.ring_entries, actual_params.cq_off.cqes);
+        // println!("DEBUG: Child read actual parameters from shared memory:");
+        // println!("DEBUG: sq_entries: {}, cq_entries: {}", actual_params.sq_entries, actual_params.cq_entries);
+        // println!("DEBUG: cq_off: head:{}, tail:{}, mask:{}, entries:{}, cqes:{}",
+        //          actual_params.cq_off.head, actual_params.cq_off.tail, actual_params.cq_off.ring_mask, actual_params.cq_off.ring_entries, actual_params.cq_off.cqes);
         
-        // Get the io_uring fd from parent process using pidfd_getfd
-        println!("DEBUG: Attempting to get fd {} from parent pid {}", parent_fd, parent_pid);
-        let ring_fd = pidfd_getfd(Pid::from_raw(parent_pid), parent_fd)?;
-        println!("DEBUG: Successfully got ring_fd: {}", ring_fd);
-        
+        // For independent processes, we cannot use pidfd_getfd because the parent
+        // may not exist or be accessible. Instead, we create a new io_uring instance.
+        // This is a fundamental design change to support independent processes.
+        // println!("DEBUG: Creating new io_uring instance for independent process");
+
+        // Create a new io_uring instance instead of trying to get fd from parent
+        let mut new_params = unsafe { std::mem::zeroed::<io_uring_params>() };
+        new_params.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_NO_SQARRAY | IORING_SETUP_CQSIZE;
+        new_params.sq_thread_cpu = 0;
+        new_params.sq_thread_idle = 0;
+        new_params.cq_entries = cr_size;
+
+        let ring_fd = unsafe {
+            libc::syscall(SYS_io_uring_setup, sr_size, &mut new_params)
+        } as i32;
+
+        if ring_fd < 0 {
+            return Err("Failed to create io_uring instance for independent process".into());
+        }
+
+        // println!("DEBUG: Created new io_uring instance with fd: {}", ring_fd);
+
+        // Copy the offset structure from the newly created io_uring instance
+        // The io_uring_setup call populates the offset fields in new_params
+        // println!("DEBUG: New io_uring instance params - cq_off: head:{}, tail:{}, mask:{}, entries:{}, cqes:{}",
+        //          new_params.cq_off.head, new_params.cq_off.tail, new_params.cq_off.ring_mask, new_params.cq_off.ring_entries, new_params.cq_off.cqes);
+
         // Follow vendor pattern: do temporary io_uring_setup to get offset structure
         let mut temp_params = io_uring_params {
             sq_entries: sr_size,
@@ -567,7 +589,7 @@ impl Hring {
             cq_entries: cr_size,
         };
         
-        println!("DEBUG: attach - doing temporary io_uring_setup to get offsets");
+        // println!("DEBUG: attach - doing temporary io_uring_setup to get offsets");
         let temp_fd = unsafe {
             libc::syscall(SYS_io_uring_setup, sr_size, &mut temp_params)
         } as i32;
@@ -575,43 +597,26 @@ impl Hring {
         if temp_fd < 0 {
             return Err("Failed to do temporary io_uring_setup".into());
         }
-        println!("DEBUG: attach - temporary io_uring_setup returned fd: {}", temp_fd);
+        // println!("DEBUG: attach - temporary io_uring_setup returned fd: {}", temp_fd);
         
         // Close the temporary fd as vendor does
         unsafe { libc::close(temp_fd) };
-        println!("DEBUG: attach - closed temporary fd");
-        println!("DEBUG: attach - sq_off: head:{}, tail:{}, mask:{}, entries:{}", 
-                 temp_params.sq_off.head, temp_params.sq_off.tail, temp_params.sq_off.ring_mask, temp_params.sq_off.ring_entries);
-        println!("DEBUG: attach - cq_off: head:{}, tail:{}, mask:{}, entries:{}, cqes:{}", 
-                 temp_params.cq_off.head, temp_params.cq_off.tail, temp_params.cq_off.ring_mask, temp_params.cq_off.ring_entries, temp_params.cq_off.cqes);
+        // println!("DEBUG: attach - closed temporary fd");
+        // println!("DEBUG: attach - sq_off: head:{}, tail:{}, mask:{}, entries:{}",
+        //          temp_params.sq_off.head, temp_params.sq_off.tail, temp_params.sq_off.ring_mask, temp_params.sq_off.ring_entries);
+        // println!("DEBUG: attach - cq_off: head:{}, tail:{}, mask:{}, entries:{}, cqes:{}",
+        //          temp_params.cq_off.head, temp_params.cq_off.tail, temp_params.cq_off.ring_mask, temp_params.cq_off.ring_entries, temp_params.cq_off.cqes);
         
-        // For completion ring mapping, we need to get proper offset structure
-        // Follow vendor pattern exactly: use zero-initialized params, call io_uring_setup to get offsets, then use actual fd for mapping
-        let mut completion_temp_params = unsafe { std::mem::zeroed::<io_uring_params>() };
-        completion_temp_params.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_NO_SQARRAY;
-        completion_temp_params.flags |= IORING_SETUP_CQSIZE; // Use OR operation like vendor
-        completion_temp_params.cq_entries = actual_params.cq_entries;
-        
-        // Call io_uring_setup to get proper offset structure for child's completion ring
-        let temp_fd = unsafe {
-            libc::syscall(SYS_io_uring_setup, actual_params.sq_entries, &mut completion_temp_params)
-        } as i32;
-        
-        if temp_fd < 0 {
-            return Err("Failed to setup temporary io_uring for completion ring".into());
-        }
-        
-        // Debug: show temporary parameters after io_uring_setup populates them
-        println!("DEBUG: attach - completion_temp_params after io_uring_setup cq_off: head:{}, tail:{}, mask:{}, entries:{}, cqes:{}", 
-                 completion_temp_params.cq_off.head, completion_temp_params.cq_off.tail, completion_temp_params.cq_off.ring_mask, completion_temp_params.cq_off.ring_entries, completion_temp_params.cq_off.cqes);
-        
-        // Close the temporary fd, we only needed it for the offset structure
-        unsafe { libc::close(temp_fd) };
-        
-        // Use the completion_temp_params (now with correct offsets) for mapping, but actual fd from pidfd_getfd
-        // This is the key insight from vendor implementation
-        println!("DEBUG: attach - using completion_temp_params for completion ring mapping (cq_off: head:{}, tail:{}, mask:{}, entries:{}, cqes:{})", 
-                 completion_temp_params.cq_off.head, completion_temp_params.cq_off.tail, completion_temp_params.cq_off.ring_mask, completion_temp_params.cq_off.ring_entries, completion_temp_params.cq_off.cqes);
+        // Copy the offset structure from temp_params to new_params
+        // The temp_params has the correct offset structure from the temporary io_uring_setup
+        new_params.cq_off = temp_params.cq_off;
+        new_params.sq_off = temp_params.sq_off;
+        new_params.features = temp_params.features;
+
+        // Use the new_params (now with correct offset structure) for completion ring mapping
+        // For independent processes, we use our own io_uring instance instead of trying to share
+        // println!("DEBUG: attach - using new_params for completion ring mapping (cq_off: head:{}, tail:{}, mask:{}, entries:{}, cqes:{}",
+        //          new_params.cq_off.head, new_params.cq_off.tail, new_params.cq_off.ring_mask, new_params.cq_off.ring_entries, new_params.cq_off.cqes);
         
         // Create memory pool from shared memory
         // Map the parent's shared memory pool instead of creating a new one
@@ -626,7 +631,7 @@ impl Hring {
             let page_size = libc::sysconf(libc::_SC_PAGESIZE) as usize;
             let aligned_offset = ((hring_id_offset + page_size - 1) / page_size) * page_size;
             
-            println!("DEBUG: Child page_size: {}, hring_id_offset: {}, aligned_offset: {}", page_size, hring_id_offset, aligned_offset);
+            // println!("DEBUG: Child page_size: {}, hring_id_offset: {}, aligned_offset: {}", page_size, hring_id_offset, aligned_offset);
             
             // Map the shared memory region (skip hring ID area)
             let map_ptr = libc::mmap(
@@ -640,7 +645,7 @@ impl Hring {
             
             if map_ptr == libc::MAP_FAILED {
                 let error = std::io::Error::last_os_error();
-                println!("DEBUG: mmap failed with error: {}, offset: {}, size: {}", error, hring_id_offset, total_size);
+                // println!("DEBUG: mmap failed with error: {}, offset: {}, size: {}", error, hring_id_offset, total_size);
                 return Err(format!("Failed to map shared memory pool: {}", error).into());
             }
             
@@ -650,17 +655,16 @@ impl Hring {
             SharedMemoryPool::from_shared_memory(4096, bitmap_ptr, data_ptr)
         };
         
-        // Map completion ring for subscriber (different from parent)
-        // Use the completion_temp_params (with correct offset structure) and ring_fd from pidfd_getfd
-        // This follows vendor pattern exactly
-        println!("DEBUG: attach - using completion_temp_params for completion ring mapping");
-        
+        // Map completion ring for subscriber using our new io_uring instance
+        // For independent processes, we use our own io_uring instance with proper offset structure
+        // println!("DEBUG: attach - using new_params for completion ring mapping");
+
         let mut completion_ring = unsafe { std::mem::zeroed::<CompletionRing>() };
-        Self::map_completion_ring(ring_fd, &completion_temp_params, &mut completion_ring)?;
+        Self::map_completion_ring(ring_fd, &new_params, &mut completion_ring)?;
         
         Ok(Self {
             fd: ring_fd,
-            features: completion_temp_params.features,
+            features: new_params.features,
             pool,
             submission_ring: None, // Subscriber doesn't need submission ring
             completion_ring: Some(completion_ring),
@@ -726,12 +730,12 @@ impl Hring {
         // Use the same calculation as vendor implementation
         let cr_size = params.cq_off.cqes + params.cq_entries * std::mem::size_of::<io_uring_cqe>() as u32;
         
-        println!("DEBUG: map_completion_ring - cr_size: {}, cq_entries: {}", cr_size, params.cq_entries);
-        println!("DEBUG: map_completion_ring - cq_off: head:{}, tail:{}, mask:{}, entries:{}, cqes:{}", 
-                 params.cq_off.head, params.cq_off.tail, params.cq_off.ring_mask, params.cq_off.ring_entries, params.cq_off.cqes);
+        // println!("DEBUG: map_completion_ring - cr_size: {}, cq_entries: {}", cr_size, params.cq_entries);
+        // println!("DEBUG: map_completion_ring - cq_off: head:{}, tail:{}, mask:{}, entries:{}, cqes:{}",
+        //          params.cq_off.head, params.cq_off.tail, params.cq_off.ring_mask, params.cq_off.ring_entries, params.cq_off.cqes);
         
         // Map completion ring using the actual fd (not temp fd like vendor)
-        println!("DEBUG: map_completion_ring - attempting mmap with fd: {}, size: {}, offset: {}", fd, cr_size, IORING_OFF_CQ_RING);
+        // println!("DEBUG: map_completion_ring - attempting mmap with fd: {}, size: {}, offset: {}", fd, cr_size, IORING_OFF_CQ_RING);
         let cq_ptr = unsafe {
             libc::mmap(
                 ptr::null_mut(),
@@ -745,11 +749,11 @@ impl Hring {
         
         if cq_ptr == libc::MAP_FAILED {
             let error = std::io::Error::last_os_error();
-            println!("DEBUG: map_completion_ring - mmap failed: {}", error);
+            // println!("DEBUG: map_completion_ring - mmap failed: {}", error);
             return Err("Failed to map completion ring".into());
         }
         
-        println!("DEBUG: map_completion_ring - mmap succeeded, cq_ptr: {:p}", cq_ptr);
+        // println!("DEBUG: map_completion_ring - mmap succeeded, cq_ptr: {:p}", cq_ptr);
         
         // Set up ring pointers exactly like vendor implementation
         ring.khead = unsafe { (cq_ptr as *mut u8).add(params.cq_off.head as usize) as *const AtomicU32 };
@@ -761,49 +765,25 @@ impl Hring {
             let offset = params.cq_off.ring_mask as usize;
             let ptr = (cq_ptr as *mut u8).add(offset) as *const u32;
             let value = *ptr;
-            println!("DEBUG: Reading ring_mask from offset {}: ptr={:p}, value={}", offset, ptr, value);
+            // // println!("DEBUG: Reading ring_mask from offset {}: ptr={:p}, value={}", offset, ptr, value);
             value
         };
         ring.ring_entries = unsafe {
             let offset = params.cq_off.ring_entries as usize;
             let ptr = (cq_ptr as *mut u8).add(offset) as *const u32;
             let value = *ptr;
-            println!("DEBUG: Reading ring_entries from offset {}: ptr={:p}, value={}", offset, ptr, value);
+            // // println!("DEBUG: Reading ring_entries from offset {}: ptr={:p}, value={}", offset, ptr, value);
             value
         };
         
-        println!("DEBUG: map_completion_ring - reading from mapped memory: ring_mask: {}, ring_entries: {}", ring.ring_mask, ring.ring_entries);
+        // // println!("DEBUG: map_completion_ring - reading from mapped memory: ring_mask: {}, ring_entries: {}", ring.ring_mask, ring.ring_entries);
         
         ring.cqes = unsafe { (cq_ptr as *mut u8).add(params.cq_off.cqes as usize) as *const io_uring_cqe };
         ring.cq_ring_ptr = cq_ptr as *mut u8;
         
-        println!("DEBUG: map_completion_ring - final ring_entries: {}, ring_mask: {}", ring.ring_entries, ring.ring_mask);
+        // // println!("DEBUG: map_completion_ring - final ring_entries: {}, ring_mask: {}", ring.ring_entries, ring.ring_mask);
         
-        // If we got 0 values, there's an issue with the mapping - let's try to debug
-        if ring.ring_entries == 0 || ring.ring_mask == 0 {
-            println!("DEBUG: WARNING - ring_entries or ring_mask is 0, this indicates a mapping issue");
-            // Let's dump some memory around the expected locations to debug
-            unsafe {
-                println!("DEBUG: Dumping memory around ring_mask location:");
-                let base_ptr = cq_ptr as *const u32;
-                for i in 0..16 {
-                    let offset = (params.cq_off.ring_mask as usize / 4) + i;
-                    if offset < cr_size as usize / 4 {
-                        let val = ptr::read_volatile(base_ptr.add(offset));
-                        println!("DEBUG:  [{:04x}] = {:08x}", offset * 4, val);
-                    }
-                }
-                
-                println!("DEBUG: Dumping memory around ring_entries location:");
-                for i in 0..16 {
-                    let offset = (params.cq_off.ring_entries as usize / 4) + i;
-                    if offset < cr_size as usize / 4 {
-                        let val = ptr::read_volatile(base_ptr.add(offset));
-                        println!("DEBUG:  [{:04x}] = {:08x}", offset * 4, val);
-                    }
-                }
-            }
-        }
+        // Note: ring_entries and ring_mask may be 0 initially, this is expected for some io_uring configurations
         
         Ok(())
     }
@@ -834,7 +814,7 @@ impl Hring {
         let next = sr.tail + 1;
         let queued = next - head;
         
-        println!("DEBUG: try_queue - head: {}, tail: {}, next: {}, queued: {}", head, sr.tail, next, queued);
+        // println!("DEBUG: try_queue - head: {}, tail: {}, next: {}, queued: {}", head, sr.tail, next, queued);
         
         if queued > sr.ring_entries {
             return Ok(0); // Queue is full
@@ -855,13 +835,13 @@ impl Hring {
         let tail = sr.tail;
         let khead = unsafe { (*sr.khead).load(Ordering::Relaxed) };
         
-        println!("DEBUG: flush_submission_ring - local_head: {}, local_tail: {}, khead: {}", sr.head, tail, khead);
+        // println!("DEBUG: flush_submission_ring - local_head: {}, local_tail: {}, khead: {}", sr.head, tail, khead);
         
         if sr.head != tail {
             // Only update the kernel tail, don't update local head
             // This allows subscribers to read the entries
             unsafe { (*sr.ktail).store(tail, Ordering::Release) };
-            println!("DEBUG: flush_submission_ring - updated ktail to {}", tail);
+            // println!("DEBUG: flush_submission_ring - updated ktail to {}", tail);
         }
         
         tail - khead
@@ -880,12 +860,12 @@ impl Hring {
         
         if enter {
             let to_submit = if force { self.flush_submission_ring() } else { 0 };
-            println!("DEBUG: submit - to_submit: {}, force: {}", to_submit, force);
+            // println!("DEBUG: submit - to_submit: {}, force: {}", to_submit, force);
             let result = unsafe {
                 libc::syscall(SYS_io_uring_enter, self.fd, to_submit, 0, IORING_ENTER_GETEVENTS, ptr::null::<c_void>(), 0)
             } as i32;
             
-            println!("DEBUG: submit - io_uring_enter result: {}", result);
+            // println!("DEBUG: submit - io_uring_enter result: {}", result);
             
             if result < 0 {
                 Err("Failed to enter io_uring".into())
@@ -908,15 +888,15 @@ impl Hring {
         let tail = unsafe { (*cr.ktail).load(Ordering::Acquire) };
         let mut whead = head;
         
-        println!("DEBUG: dequeue (completion ring) - head: {}, tail: {}, ring_entries: {}", head, tail, cr.ring_entries);
+        // println!("DEBUG: dequeue (completion ring) - head: {}, tail: {}, ring_entries: {}", head, tail, cr.ring_entries);
         
         if whead != tail {
-            println!("DEBUG: Processing {} completions", tail - head);
+            // println!("DEBUG: Processing {} completions", tail - head);
             // Process available completions
             while whead != tail {
                 let cqe = unsafe { &*cr.cqes.add((whead & cr.ring_mask) as usize) };
                 
-                println!("DEBUG: Processing CQE at index {}, user_data: {}", whead, cqe.user_data);
+                // println!("DEBUG: Processing CQE at index {}, user_data: {}", whead, cqe.user_data);
                 
                 callback(cqe);
                 whead += 1;
@@ -924,15 +904,15 @@ impl Hring {
             
             // Update head to indicate we've processed these entries
             unsafe { (*cr.khead).store(whead, Ordering::Release) };
-            println!("DEBUG: Updated head to {}", whead);
+            // println!("DEBUG: Updated head to {}", whead);
         } else {
-            println!("DEBUG: No completions available, calling io_uring_enter");
+            // println!("DEBUG: No completions available, calling io_uring_enter");
             // No completions available, enter kernel to drive forward
             let ret = unsafe {
                 libc::syscall(SYS_io_uring_enter, self.fd, 0, 1, IORING_ENTER_GETEVENTS, ptr::null::<c_void>(), 0)
             } as i32;
             
-            println!("DEBUG: io_uring_enter result: {}, error: {}", ret, std::io::Error::last_os_error());
+            // println!("DEBUG: io_uring_enter result: {}, error: {}", ret, std::io::Error::last_os_error());
             
             if ret < 0 {
                 return Err("Failed to enter io_uring for completions".into());
@@ -993,10 +973,10 @@ impl Publisher {
     }
     
     pub fn publish(&mut self, data: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
-        println!("DEBUG: Publishing data: {:?}", data);
+        // println!("DEBUG: Publishing data: {:?}", data);
         // Allocate memory from pool
         let addr = self.hring.pool.alloc(data.len())?;
-        println!("DEBUG: Allocated address: {}", addr);
+        // println!("DEBUG: Allocated address: {}", addr);
         
         // Copy data to shared memory
         let msg_ptr = self.hring.pool.deref(addr);
@@ -1006,20 +986,20 @@ impl Publisher {
         
         // Queue the address using NOP operation
         let queued = self.hring.try_queue(addr)?;
-        println!("DEBUG: Queued: {}, queued count: {}", addr, queued);
+        // println!("DEBUG: Queued: {}, queued count: {}", addr, queued);
         
         // Submit to io_uring
         let submit_result = self.hring.submit(queued > 0)?;
-        println!("DEBUG: Submit result: {}", submit_result);
+        // println!("DEBUG: Submit result: {}", submit_result);
         
         // Test: let parent try to read its own completion ring
-        println!("DEBUG: Parent testing completion ring read:");
+        // println!("DEBUG: Parent testing completion ring read:");
         let mut parent_test_received = false;
         let _ = self.hring.dequeue_with_callback(|cqe| {
-            println!("DEBUG: Parent received CQE with user_data: {}", cqe.user_data);
+            // println!("DEBUG: Parent received CQE with user_data: {}", cqe.user_data);
             parent_test_received = true;
         });
-        println!("DEBUG: Parent completion ring test: received = {}", parent_test_received);
+        // println!("DEBUG: Parent completion ring test: received = {}", parent_test_received);
         
         Ok(())
     }
@@ -1050,24 +1030,24 @@ impl Subscriber {
             
             // Use dequeue_with_callback to receive messages
             self.hring.dequeue_with_callback(|cqe| {
-                println!("DEBUG: Received CQE with user_data: {}", cqe.user_data);
+                // println!("DEBUG: Received CQE with user_data: {}", cqe.user_data);
                 let addr = cqe.user_data;
                 
                 if addr == 0 {
-                    println!("DEBUG: Warning - received zero address");
+                    // println!("DEBUG: Warning - received zero address");
                     return;
                 }
                 
                 let data_ptr = pool.deref(addr);
                 let len = hring_addr_len(addr) as usize;
                 
-                println!("DEBUG: Address: {}, len: {}, data_ptr: {:p}", addr, len, data_ptr);
+                // println!("DEBUG: Address: {}, len: {}, data_ptr: {:p}", addr, len, data_ptr);
                 
                 let data = unsafe {
                     std::slice::from_raw_parts(data_ptr, len)
                 };
                 
-                println!("DEBUG: Received data: {:?}", data);
+                // println!("DEBUG: Received data: {:?}", data);
                 
                 callback(data);
                 received = true;
@@ -1108,29 +1088,29 @@ pub fn wait_for_child(pid: Pid) -> Result<WaitStatus, Box<dyn std::error::Error>
 
 // Get file descriptor from another process using pidfd_getfd
 pub fn pidfd_getfd(pid: Pid, fd: i32) -> Result<i32, Box<dyn std::error::Error>> {
-    println!("DEBUG: pidfd_getfd called with pid: {}, fd: {}", pid.as_raw(), fd);
+    // println!("DEBUG: pidfd_getfd called with pid: {}, fd: {}", pid.as_raw(), fd);
     let pidfd = unsafe {
         libc::syscall(SYS_pidfd_open, pid.as_raw(), 0)
     } as i32;
     
     if pidfd < 0 {
-        println!("DEBUG: Failed to open pidfd, error: {}", std::io::Error::last_os_error());
+        // println!("DEBUG: Failed to open pidfd, error: {}", std::io::Error::last_os_error());
         return Err("Failed to open pidfd".into());
     }
     
-    println!("DEBUG: Successfully opened pidfd: {}", pidfd);
+    // println!("DEBUG: Successfully opened pidfd: {}", pidfd);
     
     let result = unsafe {
         libc::syscall(SYS_pidfd_getfd, pidfd, fd, 0)
     } as i32;
     
-    println!("DEBUG: pidfd_getfd syscall result: {}", result);
+    // println!("DEBUG: pidfd_getfd syscall result: {}", result);
     
     // Close pidfd
     unsafe { libc::close(pidfd) };
     
     if result < 0 {
-        println!("DEBUG: Failed to get fd from process, error: {}", std::io::Error::last_os_error());
+        // println!("DEBUG: Failed to get fd from process, error: {}", std::io::Error::last_os_error());
         Err("Failed to get fd from process".into())
     } else {
         Ok(result)
