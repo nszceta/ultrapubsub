@@ -16,6 +16,8 @@ pub const MAX_SUBSCRIBERS: usize = 16;  // Support up to 16 concurrent subscribe
 pub const BUFFER_SIZE: usize = 128 * 1024 * 1024;  // 128MB circular buffer (sufficient for 3+ 35MB messages)
 pub const MAX_MESSAGES: usize = 1024;  // Maximum number of messages in flight
 pub const MESSAGE_HEADER_SIZE: usize = 16;  // 16 bytes per message header (offset + length)
+pub const POOL_SIZE: usize = 40;  // Pre-allocated 35MB message slots for 40Hz operation
+pub const POOL_SLOT_SIZE: usize = 35 * 1024 * 1024;  // 35MB per slot
 
 // Memory layout constants
 pub const HEAD_OFFSET: usize = 0;
@@ -27,6 +29,7 @@ pub const OFFSETS_OFFSET: usize = DATA_OFFSET + BUFFER_SIZE;
 pub const LENGTHS_OFFSET: usize = OFFSETS_OFFSET + (MAX_MESSAGES * 4);
 pub const AVAILABLE_OFFSET: usize = LENGTHS_OFFSET + (MAX_MESSAGES * 2);
 pub const NOTIFICATION_FD_OFFSET: usize = AVAILABLE_OFFSET + 8;
+pub const POOL_OFFSET: usize = NOTIFICATION_FD_OFFSET + 4;  // Start of pre-allocated pool
 
 /// Shared memory ring buffer for 1:N pub/sub messaging
 ///
@@ -69,6 +72,11 @@ pub struct SharedRingBuffer {
     // Synchronization and notification
     available: [AtomicU64; 16],         // Bitmap array tracking which messages are available to which subscribers (16 * 64 = 1024 bits)
     notification_fd: AtomicI32,         // Event file descriptor for subscriber notifications
+
+    // Pre-allocated memory pool for zero-copy operations
+    pool: [[u8; POOL_SLOT_SIZE]; POOL_SIZE],  // Pre-allocated 35MB slots
+    pool_available: AtomicU64,                // Bitmap tracking which pool slots are available (64 bits, we use 40)
+    pool_sequence: [AtomicU64; POOL_SIZE],    // Sequence numbers for each pool slot
 }
 
 impl SharedRingBuffer {
@@ -133,6 +141,23 @@ impl SharedRingBuffer {
 
             // Initialize notification fd (-1 = none)
             ptr::write_volatile(&mut (*ptr).notification_fd, AtomicI32::new(-1));
+
+            // Initialize pre-allocated memory pool
+            ptr::write_volatile(&mut (*ptr).pool_available, AtomicU64::new(0));
+
+            // Mark all pool slots as available (set bits 0-39)
+            let initial_pool_bitmap: u64 = (1 << POOL_SIZE) - 1;  // Bits 0-39 set
+            ptr::write_volatile(&mut (*ptr).pool_available, AtomicU64::new(initial_pool_bitmap));
+
+            // Initialize pool sequence numbers
+            for i in 0..POOL_SIZE {
+                ptr::write_volatile(&mut (*ptr).pool_sequence[i], AtomicU64::new(0));
+            }
+
+            // Zero out pool memory
+            for i in 0..POOL_SIZE {
+                ptr::write_bytes((*ptr).pool[i].as_mut_ptr(), 0, POOL_SLOT_SIZE);
+            }
         }
 
         Ok(ptr)
@@ -287,6 +312,88 @@ impl SharedRingBuffer {
         self.notification_fd.load(Ordering::Acquire)
     }
 
+    /// Allocate a slot from the pre-allocated memory pool
+    pub fn allocate_pool_slot(&self) -> Option<usize> {
+        let mut pool_bitmap = self.pool_available.load(Ordering::Acquire);
+
+        // Find first available slot (lowest set bit)
+        for i in 0..POOL_SIZE {
+            if pool_bitmap & (1 << i) != 0 {
+                // Try to atomically claim this slot
+                let new_bitmap = pool_bitmap & !(1 << i);
+                let result = self.pool_available.compare_exchange_weak(
+                    pool_bitmap,
+                    new_bitmap,
+                    Ordering::AcqRel,
+                    Ordering::Acquire
+                );
+
+                if result.is_ok() {
+                    return Some(i);
+                }
+                // CAS failed, reload and try again
+                pool_bitmap = self.pool_available.load(Ordering::Acquire);
+            }
+        }
+
+        None  // No available slots
+    }
+
+    /// Release a pool slot back to the available pool
+    pub fn release_pool_slot(&self, slot: usize) {
+        if slot >= POOL_SIZE {
+            return;
+        }
+
+        let mut pool_bitmap = self.pool_available.load(Ordering::Acquire);
+        loop {
+            let new_bitmap = pool_bitmap | (1 << slot);
+            let result = self.pool_available.compare_exchange_weak(
+                pool_bitmap,
+                new_bitmap,
+                Ordering::AcqRel,
+                Ordering::Acquire
+            );
+
+            if result.is_ok() {
+                break;
+            }
+            // CAS failed, reload and try again
+            pool_bitmap = self.pool_available.load(Ordering::Acquire);
+        }
+    }
+
+    /// Get a mutable pointer to a pool slot for direct writing
+    pub fn get_pool_slot_mut(&self, slot: usize) -> *mut u8 {
+        if slot >= POOL_SIZE {
+            return ptr::null_mut();
+        }
+        self.pool[slot].as_ptr() as *mut u8
+    }
+
+    /// Get a pointer to a pool slot for reading
+    pub fn get_pool_slot(&self, slot: usize) -> *const u8 {
+        if slot >= POOL_SIZE {
+            return ptr::null();
+        }
+        self.pool[slot].as_ptr()
+    }
+
+    /// Set the sequence number for a pool slot
+    pub fn set_pool_sequence(&self, slot: usize, sequence: u64) {
+        if slot < POOL_SIZE {
+            self.pool_sequence[slot].store(sequence, Ordering::Release);
+        }
+    }
+
+    /// Get the sequence number for a pool slot
+    pub fn get_pool_sequence(&self, slot: usize) -> u64 {
+        if slot >= POOL_SIZE {
+            return 0;
+        }
+        self.pool_sequence[slot].load(Ordering::Acquire)
+    }
+
     /// Unmap and cleanup shared memory
     pub unsafe fn destroy(ptr: *mut SharedRingBuffer, name: &str) {
         if !ptr.is_null() {
@@ -393,6 +500,79 @@ impl RingBufferPublisher {
             }
 
             
+            Ok(sequence)
+        }
+    }
+
+    /// Zero-copy publish for large messages using pre-allocated pool
+    ///
+    /// This method allocates a slot from the pre-allocated memory pool and returns
+    /// a mutable pointer for direct writing. The caller must copy data into this slot
+    /// and then call publish_pool_slot to make it available to subscribers.
+    pub fn allocate_pool_slot(&mut self) -> Result<(usize, *mut u8), Box<dyn std::error::Error>> {
+        unsafe {
+            let buffer = &*self.buffer;
+
+            // Allocate a slot from the pool
+            if let Some(slot) = buffer.allocate_pool_slot() {
+                let slot_ptr = buffer.get_pool_slot_mut(slot);
+                if !slot_ptr.is_null() {
+                    return Ok((slot, slot_ptr));
+                } else {
+                    // Failed to get slot pointer, release the slot
+                    buffer.release_pool_slot(slot);
+                    return Err("Failed to get pool slot pointer".into());
+                }
+            }
+
+            Err("No available pool slots".into())
+        }
+    }
+
+    /// Publish a pre-allocated pool slot to subscribers
+    ///
+    /// After copying data into the pool slot, call this method to make it
+    /// available to all subscribers.
+    pub fn publish_pool_slot(&mut self, slot: usize, size: usize) -> Result<u64, Box<dyn std::error::Error>> {
+        if slot >= POOL_SIZE {
+            return Err("Invalid pool slot".into());
+        }
+
+        if size > POOL_SLOT_SIZE {
+            return Err("Message size exceeds pool slot capacity".into());
+        }
+
+        unsafe {
+            let buffer = &*self.buffer;
+
+            // Get the next message sequence number
+            let sequence = buffer.get_published_count();
+            let message_slot = (sequence % MAX_MESSAGES as u64) as usize;
+
+            // Update message metadata to point to the pool slot
+            let buffer_mut = buffer as *const SharedRingBuffer as *mut SharedRingBuffer;
+            (*buffer_mut).offsets[message_slot] = slot as u32 | 0x80000000;  // High bit indicates pool usage
+            (*buffer_mut).lengths[message_slot] = size as u32;
+
+            // Store the sequence number in the pool slot
+            buffer.set_pool_sequence(slot, sequence);
+
+            // Mark message as available for all subscribers
+            for subscriber_id in 0..self.subscriber_count.max(1) {
+                buffer.mark_message_available(sequence as usize, subscriber_id);
+            }
+
+            // Update publisher state
+            buffer.published_count.store(sequence + 1, Ordering::Release);
+
+            // Notify subscribers if notification fd is set
+            let notify_fd = buffer.get_notification_fd();
+            if notify_fd != -1 {
+                // Simple notification - write 1 byte to eventfd
+                let notification_data = 1u64;
+                libc::write(notify_fd, &notification_data as *const u64 as *const c_void, 8);
+            }
+
             Ok(sequence)
         }
     }
@@ -597,29 +777,53 @@ impl RingBufferSubscriber {
                 if buffer.is_message_available(message_slot, self.subscriber_id) {
 
                     // Get message metadata
-                    let offset = buffer.offsets[message_slot] as usize;
+                    let offset_and_flags = buffer.offsets[message_slot] as usize;
                     let length = buffer.lengths[message_slot] as usize;
 
-                    // Copy message data with wrap-around support
+                    // Check if this is a pool-based message (high bit set)
+                    let is_pool_message = (offset_and_flags & 0x80000000) != 0;
+                    let pool_slot = offset_and_flags & 0x7FFFFFFF;
+
                     let mut message_data = Vec::with_capacity(length);
-                    if offset + length <= BUFFER_SIZE {
-                        // Message is contiguous - single copy
-                        let data_ptr = buffer.data.as_ptr().add(offset);
-                        ptr::copy_nonoverlapping(data_ptr, message_data.as_mut_ptr(), length);
+
+                    if is_pool_message {
+                        // Message is in pre-allocated pool - zero-copy read
+                        if pool_slot < POOL_SIZE {
+                            let pool_ptr = buffer.get_pool_slot(pool_slot);
+                            if !pool_ptr.is_null() {
+                                // Copy directly from pool slot
+                                ptr::copy_nonoverlapping(pool_ptr, message_data.as_mut_ptr(), length);
+                                message_data.set_len(length);
+                            } else {
+                                // Invalid pool slot, skip this message
+                                continue;
+                            }
+                        } else {
+                            // Invalid pool slot, skip this message
+                            continue;
+                        }
                     } else {
-                        // Message wraps around - split into two copies
-                        let space_at_end = BUFFER_SIZE - offset;
-                        let space_at_start = length - space_at_end;
+                        // Message is in circular buffer - copy with wrap-around support
+                        let offset = offset_and_flags;  // Remove the high bit check for regular messages
+                        if offset + length <= BUFFER_SIZE {
+                            // Message is contiguous - single copy
+                            let data_ptr = buffer.data.as_ptr().add(offset);
+                            ptr::copy_nonoverlapping(data_ptr, message_data.as_mut_ptr(), length);
+                        } else {
+                            // Message wraps around - split into two copies
+                            let space_at_end = BUFFER_SIZE - offset;
+                            let space_at_start = length - space_at_end;
 
-                        // Copy first part from end of buffer
-                        let end_ptr = buffer.data.as_ptr().add(offset);
-                        ptr::copy_nonoverlapping(end_ptr, message_data.as_mut_ptr(), space_at_end);
+                            // Copy first part from end of buffer
+                            let end_ptr = buffer.data.as_ptr().add(offset);
+                            ptr::copy_nonoverlapping(end_ptr, message_data.as_mut_ptr(), space_at_end);
 
-                        // Copy second part from start of buffer
-                        let start_ptr = buffer.data.as_ptr();
-                        ptr::copy_nonoverlapping(start_ptr, message_data.as_mut_ptr().add(space_at_end), space_at_start);
+                            // Copy second part from start of buffer
+                            let start_ptr = buffer.data.as_ptr();
+                            ptr::copy_nonoverlapping(start_ptr, message_data.as_mut_ptr().add(space_at_end), space_at_start);
+                        }
+                        message_data.set_len(length);
                     }
-                    message_data.set_len(length);
 
                     // Apply filter if one is set
                     if !self.filter.apply(&message_data) {
@@ -633,6 +837,11 @@ impl RingBufferSubscriber {
 
                     // Clear availability for this message
                     buffer.clear_message_availability(sequence as usize, self.subscriber_id);
+
+                    // Release pool slot if this was a pool message
+                    if is_pool_message {
+                        buffer.release_pool_slot(pool_slot);
+                    }
 
                     return Some(message_data);
                 }

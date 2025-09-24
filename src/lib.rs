@@ -76,6 +76,16 @@ impl Publisher {
         writer(&mut data);
         self.publish(&data)
     }
+
+    /// Allocate a slot from the pre-allocated memory pool (zero-copy for large messages)
+    pub fn allocate_pool_slot(&mut self) -> Result<(usize, *mut u8), Box<dyn std::error::Error>> {
+        self.inner.allocate_pool_slot()
+    }
+
+    /// Publish a pre-allocated pool slot
+    pub fn publish_pool_slot(&mut self, slot: usize, size: usize) -> Result<u64, Box<dyn std::error::Error>> {
+        self.inner.publish_pool_slot(slot, size)
+    }
 }
 
 impl Drop for Publisher {
@@ -268,6 +278,25 @@ impl PyPublisher {
                 publisher.publish(&data)
                     .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
             }
+            None => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Publisher not initialized")),
+        }
+    }
+
+    pub fn allocate_pool_slot(&mut self) -> PyResult<(usize, usize)> {
+        match &mut self.inner {
+            Some(publisher) => {
+                let (slot, ptr) = publisher.inner.allocate_pool_slot()
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                Ok((slot, ptr as usize))
+            }
+            None => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Publisher not initialized")),
+        }
+    }
+
+    pub fn publish_pool_slot(&mut self, slot: usize, size: usize) -> PyResult<u64> {
+        match &mut self.inner {
+            Some(publisher) => publisher.inner.publish_pool_slot(slot, size)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())),
             None => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Publisher not initialized")),
         }
     }

@@ -210,6 +210,41 @@ class Publisher:
         """
         self._publisher.free_memory(ptr, size)
 
+    def allocate_pool_slot(self) -> tuple[int, int]:
+        """
+        Allocate a slot from the pre-allocated memory pool.
+
+        This method provides zero-copy access to a pre-allocated 35MB slot
+        in shared memory. The caller can write directly to this memory
+        and then publish it with publish_pool_slot.
+
+        Returns:
+            Tuple of (slot_id, memory_address) for direct writing
+
+        Raises:
+            RuntimeError: If allocation fails
+        """
+        return self._publisher.allocate_pool_slot()
+
+    def publish_pool_slot(self, slot: int, size: int) -> int:
+        """
+        Publish a pre-allocated pool slot.
+
+        After writing data to the pool slot obtained from allocate_pool_slot,
+        call this method to make the data available to subscribers.
+
+        Args:
+            slot: Slot ID from allocate_pool_slot
+            size: Size of the data written to the slot
+
+        Returns:
+            Sequence number of the published message
+
+        Raises:
+            RuntimeError: If publishing fails
+        """
+        return self._publisher.publish_pool_slot(slot, size)
+
 
 class Subscriber:
     """
