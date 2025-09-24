@@ -181,6 +181,7 @@ impl SharedMemoryPool {
             }
         }
 
+        // Initialize allocation cache (removed - not used)
         Ok(Self {
             total_size,
             bitmap,
@@ -196,6 +197,7 @@ impl SharedMemoryPool {
             free_lists[i] = free_lists_ptr.add(i * 1024);
         }
 
+        // Initialize allocation cache (removed - not used)
         Self {
             total_size,
             bitmap: bitmap_ptr,
@@ -215,7 +217,8 @@ impl SharedMemoryPool {
         // // println!("DEBUG: bitmap_find_free: returning {}", result);
         result
     }
-    
+
+
     // Allocate memory from the pool
     pub fn alloc(&self, size: usize) -> Result<HringAddr, Box<dyn std::error::Error>> {
         if size == 0 {
@@ -389,7 +392,10 @@ pub struct Hring {
     // Use separate optionals instead of union to avoid undefined behavior
     submission_ring: Option<SubmissionRing>,
     completion_ring: Option<CompletionRing>,
-    
+
+    // Flag to indicate if this is the primary (publisher) process
+    is_primary: bool,
+
     id: String,
 }
 
@@ -519,12 +525,17 @@ impl Hring {
             SharedMemoryPool::from_shared_memory(4096 * BLOCK_SIZE, bitmap_ptr, data_ptr, free_lists_ptr)
         };
         
+          // Map completion ring for primary process too
+        let mut completion_ring = unsafe { std::mem::zeroed::<CompletionRing>() };
+        Self::map_completion_ring(ring_fd, &params, &mut completion_ring)?;
+
         Ok(Self {
             fd: ring_fd,
             features: params.features,
             pool,
             submission_ring: Some(submission_ring),
-            completion_ring: None, // Parent doesn't map completion ring per vendor pattern
+            completion_ring: Some(completion_ring), // Primary needs completion ring for proper IPC
+            is_primary: true,
             id: name.to_string(),
         })
     }
@@ -784,6 +795,7 @@ impl Hring {
             pool,
             submission_ring: None, // Subscriber doesn't need submission ring
             completion_ring: Some(completion_ring),
+            is_primary: false,
             id: name.to_string(),
         })
     }
@@ -1081,32 +1093,76 @@ impl Drop for Hring {
 // Publisher using correct hring implementation
 pub struct Publisher {
     hring: Hring,
+    batch_buffer: Vec<HringAddr>,
+    batch_size: usize,
 }
 
 impl Publisher {
     pub fn new(hring: Hring) -> Result<Self, Box<dyn std::error::Error>> {
-        Ok(Self { hring })
+        Ok(Self {
+            hring,
+            batch_buffer: Vec::with_capacity(32),
+            batch_size: 16, // Submit in batches of 16
+        })
+    }
+
+    // Publish multiple messages in a batch for better performance
+    pub fn publish_batch(&mut self, messages: &[&[u8]]) -> Result<(), Box<dyn std::error::Error>> {
+        // Clear batch buffer
+        self.batch_buffer.clear();
+
+        for &data in messages {
+            // Allocate memory from pool
+            let addr = self.hring.pool.alloc(data.len())?;
+
+            // Copy data to shared memory
+            let msg_ptr = self.hring.pool.deref(addr);
+            unsafe {
+                ptr::copy_nonoverlapping(data.as_ptr(), msg_ptr, data.len());
+            }
+
+            // Queue the address using NOP operation
+            let queued = self.hring.try_queue(addr)?;
+            println!("DEBUG: Publisher - queued address: {}", addr);
+            self.batch_buffer.push(addr);
+
+            // If batch is full, submit immediately
+            if self.batch_buffer.len() >= self.batch_size {
+                println!("DEBUG: Publisher - submitting batch of size {}", self.batch_buffer.len());
+                let _submit_result = self.hring.submit(true)?;
+                self.batch_buffer.clear();
+            }
+        }
+
+        // Submit any remaining messages
+        if !self.batch_buffer.is_empty() {
+            println!("DEBUG: Publisher - submitting final batch of size {}", self.batch_buffer.len());
+            let _submit_result = self.hring.submit(true)?;
+            self.batch_buffer.clear();
+        }
+
+        Ok(())
     }
     
     pub fn publish(&mut self, data: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
-        // println!("DEBUG: Publishing data: {:?}", data);
+        println!("DEBUG: Publisher - publish() called with data length: {}", data.len());
         // Allocate memory from pool
         let addr = self.hring.pool.alloc(data.len())?;
-        // println!("DEBUG: Allocated address: {}", addr);
-        
+        println!("DEBUG: Publisher - allocated address: {}", addr);
+
         // Copy data to shared memory
         let msg_ptr = self.hring.pool.deref(addr);
         unsafe {
             ptr::copy_nonoverlapping(data.as_ptr(), msg_ptr, data.len());
         }
-        
+
         // Queue the address using NOP operation
         let queued = self.hring.try_queue(addr)?;
-        // println!("DEBUG: Queued: {}, queued count: {}", addr, queued);
-        
+        println!("DEBUG: Publisher - queued address: {}, queued count: {}", addr, queued);
+
         // Submit to io_uring
         let _submit_result = self.hring.submit(queued > 0)?;
-        // println!("DEBUG: Submit result: {}", submit_result);
+        println!("DEBUG: Publisher - submitted to io_uring");
         
         // Test: let parent try to read its own completion ring
         // println!("DEBUG: Parent testing completion ring read:");
@@ -1206,59 +1262,103 @@ impl Subscriber {
     pub fn new(hring: Hring) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self { hring })
     }
-    
+
+    // Event-driven receive that properly uses io_uring blocking behavior
     pub fn receive<F>(&mut self, mut callback: F) -> Result<(), Box<dyn std::error::Error>>
     where
         F: FnMut(&[u8]),
     {
-        let mut received = false;
-        let start_time = std::time::Instant::now();
-        let timeout = Duration::from_secs(5); // 5 second timeout
-        
-        // Wait for a message to arrive
-        while !received && start_time.elapsed() < timeout {
-            // Clone the pool before borrowing self.hring mutably
-            let pool = self.hring.pool.clone();
-            
-            // Use dequeue_with_callback to receive messages
-            self.hring.dequeue_with_callback(|cqe| {
-                // println!("DEBUG: Received CQE with user_data: {}", cqe.user_data);
-                let addr = cqe.user_data;
-                
-                if addr == 0 {
-                    // println!("DEBUG: Warning - received zero address");
-                    return;
-                }
-                
+        // Use the completion ring directly for event-driven behavior
+        let cr = self.hring.completion_ring.as_ref().ok_or("No completion ring available")?;
+
+        // Check if there are already completions available
+        let head = unsafe { (*cr.khead).load(Ordering::Relaxed) };
+        let tail = unsafe { (*cr.ktail).load(Ordering::Acquire) };
+
+        if head != tail {
+            // Process available completions immediately
+            return self.process_completions(callback);
+        }
+
+        // No completions available, use blocking io_uring_enter to wait for events
+        // This is the correct way to use io_uring - let it block until events are ready
+        let ret = unsafe {
+            libc::syscall(SYS_io_uring_enter, self.hring.fd, 0, 1, IORING_ENTER_GETEVENTS, ptr::null::<c_void>(), 0)
+        } as i32;
+
+        if ret < 0 {
+            return Err("Failed to enter io_uring for completions".into());
+        }
+
+        // Process the completions that should now be available
+        self.process_completions(callback)
+    }
+
+    // Process available completions from the completion ring
+    fn process_completions<F>(&mut self, mut callback: F) -> Result<(), Box<dyn std::error::Error>>
+    where
+        F: FnMut(&[u8]),
+    {
+        let cr = self.hring.completion_ring.as_ref().ok_or("No completion ring available")?;
+
+        let head = unsafe { (*cr.khead).load(Ordering::Relaxed) };
+        let tail = unsafe { (*cr.ktail).load(Ordering::Acquire) };
+        let mut whead = head;
+
+        // Debug: Log completion ring state
+        println!("DEBUG: process_completions - head: {}, tail: {}, ring_entries: {}, ring_mask: {}",
+                 head, tail, cr.ring_entries, cr.ring_mask);
+
+        if whead == tail {
+            return Err("No completions available".into());
+        }
+
+        // Clone the pool before borrowing self.hring mutably
+        let pool = self.hring.pool.clone();
+        let mut processed = false;
+
+        // Process all available completions
+        while whead != tail {
+            let cqe = unsafe { &*cr.cqes.add((whead & cr.ring_mask) as usize) };
+            let addr = cqe.user_data;
+
+            if addr != 0 {
                 let data_ptr = pool.deref(addr);
                 let len = hring_addr_len(addr) as usize;
-                
-                // println!("DEBUG: Address: {}, len: {}, data_ptr: {:p}", addr, len, data_ptr);
-                
+
                 let data = unsafe {
                     std::slice::from_raw_parts(data_ptr, len)
                 };
-                
-                // println!("DEBUG: Received data: {:?}", data);
-                
+
                 callback(data);
-                received = true;
-                
+                processed = true;
+
                 // Free the memory after processing
                 let _ = pool.free(addr);
-            })?;
-            
-            // Small sleep to avoid busy waiting
-            if !received {
-                thread::sleep(Duration::from_millis(10));
             }
+
+            whead += 1;
         }
-        
-        if !received {
-            return Err("No message received within timeout".into());
+
+        // Update head to indicate we've processed these entries
+        unsafe { (*cr.khead).store(whead, Ordering::Release) };
+
+        if processed {
+            Ok(())
+        } else {
+            Err("No valid messages in completions".into())
         }
-        
-        Ok(())
+    }
+
+    // Non-blocking receive that checks for available messages without waiting
+    pub fn try_receive<F>(&mut self, mut callback: F) -> Result<bool, Box<dyn std::error::Error>>
+    where
+        F: FnMut(&[u8]),
+    {
+        match self.process_completions(callback) {
+            Ok(_) => Ok(true),
+            Err(_) => Ok(false),
+        }
     }
 }
 
@@ -1388,6 +1488,13 @@ impl PyPublisher {
     // Free memory after consumption
     pub fn free_memory(&mut self, ptr: usize, len: usize) -> PyResult<()> {
         self.inner.free_memory(ptr as *mut u8, len)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+    }
+
+    // Publish multiple messages in a batch for better performance
+    pub fn publish_batch(&mut self, messages: Vec<Vec<u8>>) -> PyResult<()> {
+        let message_refs: Vec<&[u8]> = messages.iter().map(|msg| msg.as_slice()).collect();
+        self.inner.publish_batch(&message_refs)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
     }
 }

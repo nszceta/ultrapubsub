@@ -25,3 +25,4 @@ __pycache__
 performance_test_*.json
 *.pyc
 *.so
+perf.data*

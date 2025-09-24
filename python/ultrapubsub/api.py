@@ -131,6 +131,66 @@ class Publisher:
         json_str = json.dumps(obj)
         self.publish_string(json_str)
 
+    def publish_batch(self, messages: list[bytes]) -> None:
+        """
+        Publish multiple messages in a batch for better performance.
+
+        Args:
+            messages: List of byte messages to publish
+
+        Raises:
+            RuntimeError: If batch publishing fails
+        """
+        if not messages:
+            return
+
+        for msg in messages:
+            if not isinstance(msg, bytes):
+                raise TypeError("All messages must be bytes")
+
+        self._publisher.publish_batch(messages)
+
+    def allocate_and_write(self, size: int) -> int:
+        """
+        Allocate shared memory and return pointer for direct writing.
+
+        Args:
+            size: Size of memory to allocate in bytes
+
+        Returns:
+            Memory address as integer for direct writing
+
+        Raises:
+            RuntimeError: If allocation fails
+        """
+        return self._publisher.allocate_and_write(size)
+
+    def publish_allocation(self, ptr: int, size: int) -> None:
+        """
+        Publish pre-allocated shared memory.
+
+        Args:
+            ptr: Memory address from allocate_and_write
+            size: Size of the allocated memory
+
+        Raises:
+            RuntimeError: If publishing fails
+        """
+        self._publisher.publish_allocation(ptr, size)
+
+    def free_memory(self, ptr: int, size: int) -> None:
+        """
+        Free previously allocated memory.
+
+        Args:
+            ptr: Memory address to free
+            size: Size of the allocated memory
+
+        Raises:
+            RuntimeError: If freeing fails
+        """
+        self._publisher.free_memory(ptr, size)
+
 
 class Subscriber:
     """
@@ -155,17 +215,33 @@ class Subscriber:
 
         Args:
             timeout: Timeout in seconds (default: None for no timeout)
+                     Note: The implementation now uses blocking io_uring behavior,
+                     so timeout may not be exact but should be respected approximately
 
         Returns:
             Received data as bytes, or None if timeout
         """
-        # Note: The current implementation doesn't support timeout
-        # This is a limitation of the underlying Rust implementation
-        try:
-            result = self._subscriber.receive()
-            return result
-        except Exception:
-            return None
+        import time
+        start_time = time.time()
+
+        # Use blocking event-driven behavior with timeout
+        while True:
+            # Try non-blocking receive first
+            try:
+                result = self._subscriber.try_receive()
+                if result:
+                    return result
+            except Exception:
+                pass
+
+            # Check timeout
+            if timeout and (time.time() - start_time) > timeout:
+                return None
+
+            # Small sleep to avoid busy waiting
+            time.sleep(0.001)  # 1ms sleep
+
+        return None
 
     def receive_string(self, timeout: Optional[float] = None, encoding: str = 'utf-8') -> Optional[str]:
         """
