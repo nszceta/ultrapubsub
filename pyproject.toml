@@ -1,0 +1,24 @@
+[project]
+name = "ultrapubsub"
+version = "0.1.0"
+description = "Ultra-fast pub/sub using io_uring and shared memory"
+authors = [
+    {name = "ultrapubsub team"}
+]
+requires-python = ">=3.8"
+dependencies = []
+
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+python-source = "python"
+module-name = "ultrapubsub.ultrapubsub"
+features = ["pyo3/extension-module"]
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=8.0",
+    "pytest-benchmark>=4.0",
+]

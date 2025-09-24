@@ -1,0 +1,14 @@
+[package]
+name = "ultrapubsub"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "ultrapubsub"
+crate-type = ["cdylib"]
+
+[dependencies]
+io-uring = "0.7.10"
+pyo3 = { version = "0.26", features = ["extension-module"] }
+libc = "0.2.176"
+memmap2 = "0.9.8"
