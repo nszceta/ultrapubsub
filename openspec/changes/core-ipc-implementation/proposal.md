@@ -17,3 +17,9 @@ The current ultrapubsub implementation is fundamentally flawed - it uses `IORING
 - **Performance**: Target real IPC performance of ~270ns latency (vs current meaningless stdout metrics)
 - **Architecture**: Shift from single-process to true multi-process communication
 - **Compatibility**: Breaking change - Python APIs will need updates after core is fixed
+
+## Implementation Findings
+- **Fixed bitmap indexing bug**: Added bounds checking in `SharedMemoryPool::free` method to prevent index out of bounds errors when freeing invalid addresses
+- **Fixed test state management**: Memory pool correctness test needed proper cleanup of allocated blocks between test sections to avoid allocation conflicts
+- **All 14 tests now passing**: Core architecture, multi-process implementation, and memory pool validation are working correctly
+- **Performance benchmarks implemented**: IPC performance benchmark shows allocation/deallocation throughput >1000 ops/sec and address operations >10000 ops/sec
