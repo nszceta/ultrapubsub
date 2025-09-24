@@ -20,7 +20,7 @@
 - [x] 3.5 Benchmark against vendor/io-uring-ipc baseline
 
 ## 4. Python Integration
-- [ ] 4.1 Update Python bindings for new architecture
-- [ ] 4.2 Create compatibility layer for existing APIs
-- [ ] 4.3 Update test cases for multi-process scenarios
-- [ ] 4.4 Document breaking changes and migration path
+- [x] 4.1 Update Python bindings for new architecture
+- [x] 4.2 Create compatibility layer for existing APIs
+- [x] 4.3 Update test cases for multi-process scenarios
+- [x] 4.4 Document breaking changes and migration path

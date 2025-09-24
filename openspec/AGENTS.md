@@ -451,7 +451,3 @@ openspec archive [change]  # Mark complete
 ```
 
 Remember: Specs are truth. Changes are proposals. Keep them in sync.
-
-## Work in Progress
-
-For the current minimal proof of concept implementation, see `WORK_IN_PROGRESS.md` for the detailed implementation plan and current status.

@@ -440,16 +440,34 @@ impl Hring {
         if id_len == 0 {
             return Err("Failed to read valid hring ID".into());
         }
-        
-        // Parse the ID to get parent process info
-        let id_str = std::str::from_utf8(&id_buffer[..id_len])
-            .map_err(|_| "Invalid UTF-8 in hring ID")?;
-        
+
+        // Parse the ID to get parent process info - be more lenient with UTF-8
+        let id_str = match std::str::from_utf8(&id_buffer[..id_len]) {
+            Ok(s) => s,
+            Err(_) => {
+                // Try to recover by finding valid UTF-8 substring
+                let mut valid_len = id_len;
+                while valid_len > 0 {
+                    if std::str::from_utf8(&id_buffer[..valid_len]).is_ok() {
+                        break;
+                    }
+                    valid_len -= 1;
+                }
+                if valid_len == 0 {
+                    return Err("Invalid UTF-8 in hring ID".into());
+                }
+                std::str::from_utf8(&id_buffer[..valid_len]).unwrap()
+            }
+        };
+
         let (name, parent_fd, parent_pid, sr_size, cr_size) = parse_hring_id(id_str)?;
-        
-        // Calculate offset to skip hring ID (including null terminator)
+
+        // Reset file position to beginning after the null terminator
         let hring_id_offset = id_len + 1;
-        
+        unsafe {
+            libc::lseek(shm_fd.as_raw_fd(), hring_id_offset as i64, libc::SEEK_SET);
+        }
+
         // Read the actual io_uring parameters that parent stored after the ID
         let mut actual_params = unsafe { std::mem::zeroed::<io_uring_params>() };
         let params_bytes_read = unsafe {
@@ -884,7 +902,7 @@ impl Drop for Hring {
         // Cleanup mapped memory
         unsafe {
             // Clean up submission ring if it exists
-            if let Some(mut sr) = self.submission_ring.take() {
+            if let Some(sr) = self.submission_ring.take() {
                 if !sr.sq_ring_ptr.is_null() {
                     let sr_size = sr.ring_entries * std::mem::size_of::<u32>() as u32 + 
                                 std::mem::size_of::<u32>() as u32 * 5; // Approximate size
@@ -897,7 +915,7 @@ impl Drop for Hring {
             }
             
             // Clean up completion ring if it exists
-            if let Some(mut cr) = self.completion_ring.take() {
+            if let Some(cr) = self.completion_ring.take() {
                 if !cr.cq_ring_ptr.is_null() {
                     let cr_size = cr.ring_entries * std::mem::size_of::<io_uring_cqe>() as u32 + 
                                 std::mem::size_of::<u32>() as u32 * 5; // Approximate size
@@ -1179,7 +1197,7 @@ mod tests {
     use super::*;
     use std::thread;
     use std::time::Duration;
-    use std::time::Instant;
+    
 
     #[test]
     fn test_hring_addr_functions() {
