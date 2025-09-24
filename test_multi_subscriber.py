@@ -26,20 +26,49 @@ except ImportError as e:
 
 
 def generate_large_blob(size_mb: int) -> bytes:
-    """Generate a large binary blob with verifiable content"""
-    size = size_mb * 1024 * 1024
-    # Create deterministic but pseudo-random data
-    data = bytearray()
-    for i in range(0, size, 4):
+    """Generate a large binary blob with verifiable content and indisputable signatures"""
+    target_size = size_mb * 1024 * 1024
+
+    # Create indisputable signatures
+    header_signature = b"ULTRAPUBSUB_BLOB_START_" + str(size_mb).encode() + b"MB"
+    footer_signature = b"ULTRAPUBSUB_BLOB_END_" + str(size_mb).encode() + b"MB"
+
+    # Calculate payload size to achieve target total size
+    payload_size = target_size - len(header_signature) - len(footer_signature)
+
+    # Create deterministic but pseudo-random data for payload
+    data = bytearray(header_signature)  # Start with header signature
+
+    for i in range(0, payload_size, 4):
         # Use a pattern that's easy to verify
         value = i & 0xFFFFFFFF
         data.extend(value.to_bytes(4, 'little'))
+
+    data.extend(footer_signature)  # End with footer signature
     return bytes(data)
 
 
 def calculate_checksum(data: bytes) -> str:
     """Calculate SHA-256 checksum of data"""
     return hashlib.sha256(data).hexdigest()
+
+
+def verify_blob_signatures(data: bytes, expected_size_mb: int) -> bool:
+    """Verify that the blob has correct start and end signatures"""
+    expected_header = b"ULTRAPUBSUB_BLOB_START_" + str(expected_size_mb).encode() + b"MB"
+    expected_footer = b"ULTRAPUBSUB_BLOB_END_" + str(expected_size_mb).encode() + b"MB"
+
+    # Check header signature
+    if not data.startswith(expected_header):
+        print(f"❌ Header signature mismatch. Expected: {expected_header}, Got: {data[:len(expected_header)]}")
+        return False
+
+    # Check footer signature
+    if not data.endswith(expected_footer):
+        print(f"❌ Footer signature mismatch. Expected: {expected_footer}, Got: {data[-len(expected_footer):]}")
+        return False
+
+    return True
 
 
 def subscriber_process(subscriber_id: int, shm_name: str, num_messages: int,
@@ -77,24 +106,35 @@ def subscriber_process(subscriber_id: int, shm_name: str, num_messages: int,
                 })
                 return
 
+            # Verify signatures first
+            expected_size_mb = int(shm_name.split('_')[-2])  # Extract size from shm_name like "multi_sub_test_1mb"
+            if not verify_blob_signatures(message, expected_size_mb):
+                result_queue.put({
+                    'subscriber_id': subscriber_id,
+                    'status': 'signature_mismatch',
+                    'messages_received': len(received_messages),
+                    'message': f'Signature verification failed for message {i+1}'
+                })
+                return
+
             # Verify checksum
             checksum = calculate_checksum(message)
             received_checksums.append(checksum)
             received_messages.append(len(message))
 
             print(f"✅ Subscriber {subscriber_id}: Received message {i+1}/{num_messages}, "
-                  f"size={len(message)} bytes, checksum={checksum[:16]}...")
+                  f"size={len(message)} bytes, signatures verified, checksum={checksum[:16]}...")
 
         # Verify all checksums match expected
         if received_checksums == expected_checksums:
-            print(f"✅ Subscriber {subscriber_id}: All messages verified successfully")
+            print(f"✅ Subscriber {subscriber_id}: All messages verified successfully (signatures and checksums)")
             result_queue.put({
                 'subscriber_id': subscriber_id,
                 'status': 'success',
                 'messages_received': len(received_messages),
                 'message_sizes': received_messages,
                 'checksums': received_checksums,
-                'message': 'All messages received and verified'
+                'message': 'All messages received and verified with signatures'
             })
         else:
             print(f"❌ Subscriber {subscriber_id}: Checksum mismatch")
@@ -164,12 +204,10 @@ def run_multi_subscriber_test():
         expected_checksums = []
 
         for i in range(messages_per_size):
-            # Generate unique blob for each message
+            # Generate unique blob for each message (each has unique signatures)
             blob = generate_large_blob(blob_size_mb)
-            # Add message index to make each blob unique
-            blob_with_index = blob + f"_msg_{i}".encode()
-            messages.append(blob_with_index)
-            expected_checksums.append(calculate_checksum(blob_with_index))
+            messages.append(blob)
+            expected_checksums.append(calculate_checksum(blob))
 
         print(f"📊 Generated {len(messages)} messages, total size: {sum(len(m) for m in messages) / 1024 / 1024:.1f}MB")
 

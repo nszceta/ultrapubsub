@@ -193,7 +193,7 @@ impl SharedMemoryPool {
                 bitmap[i].fetch_and(mask, Ordering::Relaxed);
                 
                 let block_index = (i * 64 + bit_idx as usize) as u32;
-                let addr = size_part | block_index as u64;
+                let addr = (size_part & 0xFFFFFFFF00000000) | (block_index as u64 & 0xFFFFFFFF);
                 println!("DEBUG: alloc returning addr: {} (size_part: {}, block_index: {})", addr, size_part, block_index);
                 return Ok(addr);
             }
@@ -327,10 +327,20 @@ impl Hring {
         
         // Create hring ID and write to shared memory
         let hring_id = format_hring_id(name, ring_fd, std::process::id() as i32, entries, params.cq_entries);
-        
+
         // Also store the actual io_uring parameters for child to use
-        println!("DEBUG: Parent - storing actual cq_off: head:{}, tail:{}, mask:{}, entries:{}, cqes:{}", 
+        println!("DEBUG: Parent - storing actual cq_off: head:{}, tail:{}, mask:{}, entries:{}, cqes:{}",
                  params.cq_off.head, params.cq_off.tail, params.cq_off.ring_mask, params.cq_off.ring_entries, params.cq_off.cqes);
+
+        // Debug the hring ID
+        println!("DEBUG: Parent - raw hring_id ptr: {:p}, len: {}", hring_id.as_ptr(), hring_id.len());
+        let hex_bytes: Vec<String> = hring_id.as_bytes().iter().map(|b| format!("{:02x}", b)).collect();
+        println!("DEBUG: Parent - hring_id hex: {}", hex_bytes.join(" "));
+
+        // Check if the string actually has null terminator at len() position
+        let hring_id_cstr = std::ffi::CString::new(hring_id.clone()).unwrap();
+        let cstr_bytes: Vec<String> = hring_id_cstr.as_bytes_with_nul().iter().map(|b| format!("{:02x}", b)).collect();
+        println!("DEBUG: Parent - hring_id as CString: {}", cstr_bytes.join(" "));
         
         // Let's also dump what the parent reads from its own mapped memory to verify
         println!("DEBUG: Parent - checking what parent reads from its own completion ring:");
@@ -350,10 +360,14 @@ impl Hring {
         };
         
         unsafe {
-            // Write hring ID as null-terminated string
-            libc::write(fd.as_raw_fd(), hring_id.as_ptr() as *const libc::c_void, hring_id.len() + 1); // +1 for null terminator
-            // Write actual parameters after the null terminator
-            libc::write(fd.as_raw_fd(), &actual_params as *const io_uring_params as *const libc::c_void, std::mem::size_of::<io_uring_params>());
+            // Write hring ID as null-terminated string using CString to ensure null terminator
+            let hring_id_cstr = std::ffi::CString::new(hring_id.clone()).unwrap();
+            let id_bytes_written = libc::write(fd.as_raw_fd(), hring_id_cstr.as_ptr() as *const libc::c_void, hring_id_cstr.as_bytes_with_nul().len());
+            println!("DEBUG: Parent - hring_id: '{}', len: {}, wrote: {} bytes", hring_id, hring_id_cstr.as_bytes_with_nul().len(), id_bytes_written);
+
+            // Write actual parameters immediately after the null terminator (no alignment needed)
+            let params_bytes_written = libc::write(fd.as_raw_fd(), &actual_params as *const io_uring_params as *const libc::c_void, std::mem::size_of::<io_uring_params>());
+            println!("DEBUG: Parent - wrote params: {} bytes", params_bytes_written);
         }
         
         // Create memory pool in shared memory
@@ -412,8 +426,31 @@ impl Hring {
         )?;
         
         println!("DEBUG: Child opened shared memory fd: {}", shm_fd.as_raw_fd());
-        
-        // Read the hring ID from shared memory (null-terminated string)
+
+        // Check current file position
+        let start_pos = unsafe { libc::lseek(shm_fd.as_raw_fd(), 0, libc::SEEK_CUR) };
+        println!("DEBUG: Child - starting file position: {}", start_pos);
+
+        // Reset to beginning of file to read hring ID
+        unsafe { libc::lseek(shm_fd.as_raw_fd(), 0, libc::SEEK_SET); };
+
+        // Read exactly what the parent wrote (hring_id.len() + 1 bytes)
+        let mut exact_buffer = [0u8; 256];
+        let exact_bytes_read = unsafe {
+            libc::read(shm_fd.as_raw_fd(), exact_buffer.as_mut_ptr() as *mut libc::c_void, 28) // Parent said it wrote 28 bytes
+        };
+
+        println!("DEBUG: Child - attempted to read 28 bytes, got {} bytes", exact_bytes_read);
+
+        let exact_hex: Vec<String> = exact_buffer[..exact_bytes_read as usize].iter()
+            .map(|b| format!("{:02x}", b))
+            .collect();
+        println!("DEBUG: Child - exact read hex: {}", exact_hex.join(" "));
+
+        // Reset position to read hring ID again
+        unsafe { libc::lseek(shm_fd.as_raw_fd(), 0, libc::SEEK_SET); };
+
+        // Now read the hring ID from shared memory (null-terminated string)
         let mut id_buffer = [0u8; 256];
         let mut total_bytes_read = 0;
         let mut id_len = 0;
@@ -423,19 +460,26 @@ impl Hring {
             let bytes_read = unsafe {
                 libc::read(shm_fd.as_raw_fd(), id_buffer.as_mut_ptr().add(total_bytes_read) as *mut libc::c_void, 1)
             };
-            
+
             if bytes_read <= 0 {
                 break;
             }
-            
+
             total_bytes_read += bytes_read as usize;
-            
-            // Check if we hit null terminator
+
+            // Check if we hit null terminator - if so, stop reading immediately
             if id_buffer[total_bytes_read - 1] == 0 {
                 id_len = total_bytes_read - 1; // Exclude null terminator
+                println!("DEBUG: Child - found null terminator at position {}, stopping", total_bytes_read - 1);
+                // Print hex dump of what we read
+                let hex_str: Vec<String> = id_buffer[..total_bytes_read].iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect();
+                println!("DEBUG: Child - hex dump: {}", hex_str.join(" "));
                 break;
             }
         }
+        println!("DEBUG: Child - total_bytes_read: {}, id_len: {}", total_bytes_read, id_len);
         
         if id_len == 0 {
             return Err("Failed to read valid hring ID".into());
@@ -460,20 +504,22 @@ impl Hring {
             }
         };
 
+        println!("DEBUG: Child - parsed hring ID: '{}', len: {}", id_str, id_str.len());
         let (name, parent_fd, parent_pid, sr_size, cr_size) = parse_hring_id(id_str)?;
 
-        // Reset file position to beginning after the null terminator
-        let hring_id_offset = id_len + 1;
-        unsafe {
-            libc::lseek(shm_fd.as_raw_fd(), hring_id_offset as i64, libc::SEEK_SET);
-        }
+        // After reading the hring ID including null terminator, we should already be at the right position
+        let current_pos = unsafe { libc::lseek(shm_fd.as_raw_fd(), 0, libc::SEEK_CUR) };
+        println!("DEBUG: Child - current position after reading hring ID: {}", current_pos);
+
+        let hring_id_offset = current_pos as usize;
 
         // Read the actual io_uring parameters that parent stored after the ID
         let mut actual_params = unsafe { std::mem::zeroed::<io_uring_params>() };
         let params_bytes_read = unsafe {
             libc::read(shm_fd.as_raw_fd(), &mut actual_params as *mut io_uring_params as *mut libc::c_void, std::mem::size_of::<io_uring_params>())
         };
-        
+
+        println!("DEBUG: Child - read params: {} bytes", params_bytes_read);
         if params_bytes_read as usize != std::mem::size_of::<io_uring_params>() {
             return Err("Failed to read io_uring parameters from shared memory".into());
         }
