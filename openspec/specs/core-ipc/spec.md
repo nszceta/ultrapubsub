@@ -1,5 +1,17 @@
 # Core IPC Specification
 
+## ⚠️ Important Warning: Do NOT Use io_uring
+
+**CRITICAL**: The io_uring-based approach has been deprecated and abandoned due to fundamental architectural issues. All implementations MUST use the Shared Memory Ring Buffer approach described in this specification.
+
+**Why io_uring Failed**:
+- io_uring operations submitted successfully but generated zero completions
+- Complex ring sharing between processes proved unreliable
+- Kernel completion ring mechanism unsuitable for message passing
+- Unpredictable behavior under high-frequency messaging scenarios
+
+**Current Implementation**: Shared Memory Ring Buffer with atomic operations only
+
 ## Purpose
 
 The Core IPC capability provides high-performance inter-process communication using Shared Memory Ring Buffer with atomic operations. It enables zero-copy message passing between processes with lock-free synchronization and support for large binary data transmission at 1.4 GB/s throughput (35 MB payloads at 40 Hz).
@@ -78,25 +90,46 @@ The system SHALL support transmission of large binary data (35 MB payloads) with
 - **AND** checksum verification SHALL provide additional integrity validation
 
 ### Requirement: Zero-Copy Message Passing
-The system SHALL implement zero-copy semantics using HringAddr references instead of data copying.
+The system SHALL implement zero-copy semantics using direct shared memory access instead of data copying.
 
-#### Scenario: HringAddr Creation
-- **WHEN** a memory block is allocated
-- **THEN** the system SHALL generate a 64-bit HringAddr containing size and block index
-- **AND** the address SHALL uniquely identify the memory location
-- **AND** the address SHALL be shareable between processes
+#### Scenario: Pool Slot Allocation
+- **WHEN** a memory block is allocated from the pre-allocated pool
+- **THEN** the system SHALL allocate a 35MB pool slot
+- **AND** the slot SHALL be tracked using atomic bitmap operations
+- **AND** the slot SHALL be shareable between processes
 
 #### Scenario: Zero-Copy Transmission
-- **WHEN** sending a message using io_uring
-- **THEN** the system SHALL use IORING_OP_NOP operations with HringAddr references
+- **WHEN** sending a message using the pool-based system
+- **THEN** the system SHALL use direct memory references
 - **AND** no data SHALL be copied between processes
 - **AND** the receiver SHALL access the original memory location
 
 #### Scenario: Memory Reference Safety
-- **WHEN** multiple processes access shared memory via HringAddr
+- **WHEN** multiple processes access shared memory pool slots
 - **THEN** the system SHALL prevent use-after-free conditions
 - **AND** the system SHALL validate all memory references
 - **AND** invalid addresses SHALL be rejected
+
+### Requirement: Pre-allocated Memory Pool
+The system SHALL provide a pre-allocated memory pool for high-frequency zero-copy operations.
+
+#### Scenario: Pool Initialization
+- **WHEN** initializing the shared memory system
+- **THEN** the system SHALL allocate 63 pre-allocated 35MB slots
+- **AND** the system SHALL initialize atomic bitmap for slot tracking
+- **AND** the system SHALL make slots immediately available
+
+#### Scenario: Pool Slot Management
+- **WHEN** allocating a pool slot
+- **THEN** the system SHALL atomically claim an available slot
+- **AND** the system SHALL track slot usage with sequence numbers
+- **AND** the system SHALL release slots back to the pool after use
+
+#### Scenario: High-Frequency Operations
+- **WHEN** operating at 40+ Hz frequency
+- **THEN** the system SHALL sustain allocation/release cycles without fragmentation
+- **AND** the system SHALL maintain consistent access times
+- **AND** the system SHALL handle slot exhaustion gracefully
 
 ### Requirement: Shared Memory Naming and Management
 The system SHALL provide proper shared memory management with unique naming conventions.

@@ -2,7 +2,19 @@
 
 ## Context
 
-The Core IPC system implements high-performance inter-process communication using Linux io_uring with shared memory pools. This design document provides technical details on the architecture, patterns, and implementation decisions.
+The Core IPC system implements high-performance inter-process communication using Shared Memory Ring Buffer with atomic operations. This design document provides technical details on the architecture, patterns, and implementation decisions.
+
+## ⚠️ Important Warning: Do NOT Use io_uring
+
+**CRITICAL**: The io_uring-based approach has been deprecated and abandoned due to fundamental architectural issues. All implementations MUST use the Shared Memory Ring Buffer approach described in this specification.
+
+**Why io_uring Failed**:
+- io_uring operations submitted successfully but generated zero completions
+- Complex ring sharing between processes proved unreliable
+- Kernel completion ring mechanism unsuitable for message passing
+- Unpredictable behavior under high-frequency messaging scenarios
+
+**Current Implementation**: Shared Memory Ring Buffer with atomic operations only
 
 ## Architecture Overview
 
@@ -14,13 +26,15 @@ The Core IPC system implements high-performance inter-process communication usin
 │   Process       │    │   Process       │    │   Process       │
 │                 │    │                 │    │                 │
 │  ┌───────────┐  │    │  ┌───────────┐  │    │  ┌───────────┐  │
-│  │SharedMemory│  │    │  │SharedMemory│  │    │  │SharedMemory│  │
-│  │   Pool    │  │    │  │   Pool    │  │    │  │   Pool    │  │
+│  │   Shared │  │    │  │   Shared │  │    │  │   Shared │  │
+│  │  Memory  │  │    │  │  Memory  │  │    │  │  Memory  │  │
+│  │   Pool   │  │    │  │   Pool   │  │    │  │   Pool   │  │
 │  └───────────┘  │    │  └───────────┘  │    │  └───────────┘  │
 │        │        │    │        │        │    │        │        │
 │  ┌───────────┐  │    │  ┌───────────┐  │    │  ┌───────────┐  │
-│  │  Hring    │  │    │  │  Hring    │  │    │  │  Hring    │  │
-│  │ Ring      │  │    │  │ Ring      │  │    │  │ Ring      │  │
+│  │Ring Buffer│  │    │  │Ring Buffer│  │    │  │Ring Buffer│  │
+│  │   with   │  │    │  │   with   │  │    │  │   with   │  │
+│  │ Atomics  │  │    │  │ Atomics  │  │    │  │ Atomics  │  │
 │  └───────────┘  │    │  └───────────┘  │    │  └───────────┘  │
 │        │        │    │        │        │    │        │        │
 │        └────────┼────┼────────┼────────┼────┼────────┘        │
@@ -38,132 +52,133 @@ The Core IPC system implements high-performance inter-process communication usin
 
 ### Key Data Structures
 
-#### SharedMemoryPool
+#### SharedRingBuffer
 ```rust
-pub struct SharedMemoryPool {
+pub struct SharedRingBuffer {
     fd: i32,                    // File descriptor for shared memory
     ptr: *mut u8,              // Pointer to mapped memory
-    size: usize,                // Total pool size
-    block_size: usize,          // Size of each allocation block
-    num_blocks: usize,          // Number of blocks in pool
-    bitmap: *mut u8,            // Bitmap for tracking allocated blocks
-    hring_id: String,           // Unique identifier for this pool
+    size: usize,                // Total buffer size
+    head: AtomicU64,           // Atomic head pointer for publisher
+    tails: [AtomicU64; 16],     // Atomic tail pointers for subscribers
+    offsets: [u32; MAX_MESSAGES], // Message offsets in buffer
+    lengths: [u32; MAX_MESSAGES], // Message lengths
+    available: [AtomicU64; 16], // Bitmap tracking message availability
+    pool: [[u8; POOL_SLOT_SIZE]; POOL_SIZE],  // Pre-allocated 35MB slots
+    pool_available: AtomicU64,                // Bitmap tracking pool slots
+    pool_sequence: [AtomicU64; POOL_SIZE],    // Sequence numbers for slots
 }
 ```
 
-#### HringAddr
+#### PoolSlot
 ```rust
-pub struct HringAddr(u64);
+pub struct PoolSlot {
+    slot_index: usize,          // Index in the pre-allocated pool
+    size: usize,                // Actual data size
+    sequence: u64,              // Sequence number for tracking
+    is_valid: bool,             // Slot validity flag
+}
 
-impl HringAddr {
-    // 64-bit address format:
-    // bits 63-32: size_part (32 bits for block size/alignment)
-    // bits 31-0:  block_index (32 bits for block index)
-
-    pub fn new(size: usize, block_index: u32) -> Self
+impl PoolSlot {
+    pub fn new(slot_index: usize, size: usize, sequence: u64) -> Self
+    pub fn slot_index(&self) -> usize
     pub fn size(&self) -> usize
-    pub fn block_index(&self) -> u32
+    pub fn sequence(&self) -> u64
     pub fn is_valid(&self) -> bool
 }
 ```
 
-#### Hring
+#### RingBuffer
 ```rust
-pub struct Hring {
-    fd: i32,                    // io_uring file descriptor
-    sq_ptr: *mut u8,           // Submission queue pointer
-    cq_ptr: *mut u8,           // Completion queue pointer
-    sq_entries: u32,           // Submission queue entries
-    cq_entries: u32,           // Completion queue entries
-    flags: u32,                // Ring flags
-    features: u32,             // Ring features
+pub struct RingBuffer {
+    fd: i32,                    // Shared memory file descriptor
+    ptr: *mut u8,              // Pointer to mapped memory
+    size: usize,                // Total buffer size
+    max_messages: usize,        // Maximum number of messages
+    max_subscribers: usize,    // Maximum number of subscribers
 }
 ```
 
 ## Implementation Patterns
 
-### Memory Pool Management
+### Pre-allocated Memory Pool Management
 
-#### Bitmap Allocation Strategy
-- **Block Size**: 4KB (matching vendor implementation)
-- **Bitmap Representation**: 1 bit per block (0 = free, 1 = allocated)
-- **Allocation Algorithm**: First-fit with bounds checking
-- **Fragmentation Handling**: Contiguous block allocation only
+#### Pool Constants
+- **Slot Size**: 35MB (matching performance requirements)
+- **Pool Size**: 63 slots (maximum for u64 bitmap)
+- **Bitmap Format**: 1 bit per slot (0 = free, 1 = allocated)
+- **Allocation Strategy**: First available slot with atomic operations
+- **Sequence Tracking**: Atomic sequence numbers per slot
 
 #### Memory Layout
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                     Shared Memory Pool                      │
+│                 Shared Memory Pool                          │
 ├─────────────────────────────────────────────────────────────┤
-│ Bitmap (1 bit per 4KB block)                               │
+│ Ring Buffer Structure                                        │
+│ - head/tail pointers                                        │
+│ - message metadata                                          │
+│ - availability bitmap                                      │
 ├─────────────────────────────────────────────────────────────┤
-│ Available Memory Blocks (4KB each)                         │
-│ [Block 0][Block 1][Block 2]...[Block N-1]                  │
+│ Pre-allocated Pool Slots (35MB each)                       │
+│ [Slot 0][Slot 1][Slot 2]...[Slot 62]                      │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-#### Allocation Process
-1. Calculate required blocks: `ceil(size / block_size)`
-2. Find contiguous free blocks in bitmap
-3. Mark blocks as allocated in bitmap
-4. Return HringAddr with size and starting block index
+#### Pool Slot Allocation Process
+1. Atomically check pool availability bitmap
+2. Find first available slot using bit operations
+3. Atomically claim slot and assign sequence number
+4. Return slot pointer and index to caller
 
-#### Deallocation Process
-1. Validate HringAddr bounds
-2. Calculate block range from address
-3. Mark blocks as free in bitmap
-4. Update memory tracking
+#### Pool Slot Release Process
+1. Validate slot index and sequence number
+2. Mark slot as available in bitmap
+3. Update sequence tracking
+4. Return slot to pool
 
-### io_uring Integration
+### Atomic Operation Integration
 
-#### Submission Queue Operations
-- **Primary Operation**: `IORING_OP_NOP` for zero-copy IPC
-- **User Data**: HringAddr (64-bit memory reference)
-- **Flags**: `IOSQE_IO_LINK` for chained operations when needed
+#### Head Pointer Updates
+- **Operation**: Atomic compare-and-swap for head advancement
+- **Memory Ordering**: Sequential consistency for cross-process visibility
+- **Overflow Handling**: Wrap-around with sequence number tracking
 
-#### Completion Queue Processing
-- **Event Handling**: Process completions in batches
-- **Error Detection**: Check result codes for operation failures
-- **Memory Cleanup**: Free resources on failed operations
+#### Tail Pointer Updates
+- **Operation**: Atomic loads and stores per subscriber
+- **Memory Ordering**: Acquire-release semantics
+- **Independent Tracking**: Each subscriber maintains separate tail pointer
 
-#### Ring Sharing Architecture
-```
-Parent Process                     Child Process
-┌─────────────┐                 ┌─────────────┐
-│   Hring     │                 │   Hring     │
-│   Ring      │                 │   Ring      │
-│             │                 │             │
-│ SQ ────────┐│                 │┌───────── SQ │
-│ CQ ────────┘│                 │└───────── CQ │
-└──────┬──────┘                 └───────┬─────┘
-       │                               │
-       └─────────── Shared Memory ──────┘
-       │           Completion Ring       │
-       └───────────────────────────────┘
-```
+#### Bitmap Operations
+- **Availability Updates**: Atomic bitwise operations
+- **Subscriber Tracking**: 16 separate bitmap words for 16 subscribers
+- **Message Indexing**: 1024 message slots (16 × 64 bits)
 
 ### Multi-Process Architecture
 
 #### Process Creation Flow
-1. **Parent**: Create shared memory pool with unique hring_id
-2. **Parent**: Initialize io_uring ring with proper parameters
+1. **Parent**: Create shared memory region with unique identifier
+2. **Parent**: Initialize ring buffer with atomic head/tail pointers
 3. **Parent**: Fork child process using `fork()`
-4. **Child**: Attach to parent's shared memory using hring_id
-5. **Child**: Use `pidfd_getfd()` to get ring file descriptor
-6. **Child**: Map completion ring using obtained descriptor
+4. **Child**: Attach to parent's shared memory using identifier
+5. **Child**: Initialize subscriber with independent tail pointer
+6. **Child**: Begin receiving messages from shared ring buffer
 
 #### Shared Memory Naming
-- **Pattern**: `/dev/shm/ultrapubsub_[hring_id]`
+- **Pattern**: `/dev/shm/ultrapubsub_[identifier]`
 - **Uniqueness**: Include process ID and timestamp
 - **Cleanup**: Automatic unlink on last process exit
 
-#### File Descriptor Sharing
+#### Shared Memory Attachment
 ```rust
-// Parent creates pidfd for child
-let pidfd = syscall(SYS_pidfd_open, child_pid, 0);
+// Parent creates shared memory
+let shm_name = format!("/dev/shm/ultrapubsub_{}_{}", pid, timestamp);
+let fd = shm_open(&shm_name, O_CREAT | O_RDWR, 0666);
+ftruncate(fd, buffer_size);
+let ptr = mmap(nullptr, buffer_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 
-// Child uses pidfd_getfd to get ring fd
-let ring_fd = syscall(SYS_pidfd_getfd, pidfd, parent_ring_fd, 0);
+// Child attaches to existing shared memory
+let fd = shm_open(&shm_name, O_RDWR, 0666);
+let ptr = mmap(nullptr, buffer_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 ```
 
 ### Large Binary Blob Handling
@@ -203,7 +218,7 @@ struct BlobSignature {
 
 #### Process Communication Errors
 - **Attachment Failure**: Return `Error::AttachFailed`
-- **Ring Sharing**: Return `Error::RingSharingFailed`
+- **Memory Sharing**: Return `Error::MemorySharingFailed`
 - **Process Exit**: Handle cleanup automatically
 
 #### Data Integrity Errors
@@ -218,10 +233,19 @@ struct BlobSignature {
 - **Contiguous Allocation**: Minimize memory fragmentation
 - **Zero-Copy**: Avoid data copying between processes
 
-### io_uring Optimizations
-- **Batch Operations**: Process multiple completions at once
-- **Ring Buffer Management**: Efficient head/tail pointer updates
-- **System Call Reduction**: Minimize io_uring_enter calls
+### Zero-Copy Pool Management
+
+#### Pool Slot Access
+- **Direct Memory Access**: No copying between publisher and subscribers
+- **Atomic Operations**: Lock-free slot allocation and release
+- **Memory Safety**: Bounds checking and sequence number validation
+
+#### Pool Slot Usage
+1. Publisher allocates slot from pre-allocated pool
+2. Publisher writes data directly to slot memory
+3. Publisher publishes slot index with sequence number
+4. Subscribers read data directly from shared slot memory
+5. Publisher releases slot back to pool after all subscribers
 
 ### Multi-Process Optimizations
 - **Shared Memory**: Direct memory access between processes
@@ -233,10 +257,10 @@ struct BlobSignature {
 ### Memory Safety
 - **Bounds Checking**: All array accesses are bounds-checked
 - **Null Termination**: Proper handling of C-style strings
-- **Reference Validation**: HringAddr validation before use
+- **Reference Validation**: PoolSlot validation before use
 
 ### Process Isolation
-- **File Descriptor Sharing**: Secure sharing using pidfd_getfd
+- **Shared Memory Security**: Secure memory mapping with proper permissions
 - **Memory Permissions**: Appropriate read/write permissions
 - **Resource Limits**: Prevent resource exhaustion attacks
 
@@ -249,28 +273,30 @@ struct BlobSignature {
 
 ### Unit Tests
 - **Memory Pool**: Test allocation, deallocation, error cases
-- **HringAddr**: Test creation, validation, operations
+- **PoolSlot**: Test creation, validation, operations
 - **Bitmap**: Test bit manipulation, bounds checking
 - **Shared Memory**: Test creation, attachment, cleanup
+- **Atomic Operations**: Test head/tail pointer operations
 
 ### Integration Tests
-- **Multi-Process**: Test fork/exec, ring sharing
-- **Large Data**: Test blob generation, verification
-- **Performance**: Test latency, throughput metrics
+- **Multi-Process**: Test fork/exec, shared memory attachment
+- **Large Data**: Test 35MB blob generation, verification
+- **Performance**: Test 40Hz frequency, 1.4GB/s throughput metrics
 - **Error Handling**: Test error conditions, recovery
+- **Zero-Copy**: Test pre-allocated pool operations
 
 ### Stress Tests
-- **High Frequency**: Test 40Hz messaging scenarios
-- **Memory Pressure**: Test under memory constraints
-- **Concurrent Access**: Test multiple processes
-- **Long Duration**: Test stability over time
+- **High Frequency**: Test sustained 40Hz messaging with 35MB payloads
+- **Memory Pressure**: Test 6 subscribers × 35MB = 210MB memory footprint
+- **Concurrent Access**: Test 6 independent subscriber processes
+- **Long Duration**: Test stability over extended 40Hz operation
 
 ## Future Enhancements
 
 ### Performance Improvements
-- **Adaptive Block Sizes**: Dynamic block size allocation
+- **Adaptive Pool Sizes**: Dynamic slot size allocation
 - **Memory Compression**: Optional compression for large data
-- **Batch Processing**: More efficient batch operations
+- **Batch Processing**: More efficient slot allocation operations
 
 ### Feature Enhancements
 - **Message Filtering**: Subscriber-side message filtering
@@ -278,6 +304,6 @@ struct BlobSignature {
 - **Statistics**: Performance metrics and monitoring
 
 ### Platform Support
-- **Alternative Kernels**: Support for other async I/O interfaces
+- **Alternative Atomic Implementations**: Support for different CPU architectures
 - **Cross-Platform**: Windows/macOS support (if needed)
-- **Hardware Acceleration**: GPU-assisted operations
+- **Hardware Acceleration**: GPU-assisted memory operations
