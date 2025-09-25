@@ -8,7 +8,6 @@ name = "ultrapubsub"
 crate-type = ["cdylib"]
 
 [dependencies]
-io-uring = "0.7.10"
 pyo3 = { version = "0.26", features = ["extension-module"] }
 pyo3-ffi = "0.26"
 libc = "0.2.176"

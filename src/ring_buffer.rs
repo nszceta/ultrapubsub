@@ -16,7 +16,7 @@ pub const MAX_SUBSCRIBERS: usize = 16;  // Support up to 16 concurrent subscribe
 pub const BUFFER_SIZE: usize = 128 * 1024 * 1024;  // 128MB circular buffer (sufficient for 3+ 35MB messages)
 pub const MAX_MESSAGES: usize = 1024;  // Maximum number of messages in flight
 pub const MESSAGE_HEADER_SIZE: usize = 16;  // 16 bytes per message header (offset + length)
-pub const POOL_SIZE: usize = 40;  // Pre-allocated 35MB message slots for 40Hz operation
+pub const POOL_SIZE: usize = 63;  // Pre-allocated 35MB message slots for high-frequency operation
 pub const POOL_SLOT_SIZE: usize = 35 * 1024 * 1024;  // 35MB per slot
 
 // Memory layout constants
@@ -145,8 +145,8 @@ impl SharedRingBuffer {
             // Initialize pre-allocated memory pool
             ptr::write_volatile(&mut (*ptr).pool_available, AtomicU64::new(0));
 
-            // Mark all pool slots as available (set bits 0-39)
-            let initial_pool_bitmap: u64 = (1 << POOL_SIZE) - 1;  // Bits 0-39 set
+            // Mark all pool slots as available (set bits 0-63)
+            let initial_pool_bitmap: u64 = (1 << POOL_SIZE) - 1;  // Bits 0-63 set
             ptr::write_volatile(&mut (*ptr).pool_available, AtomicU64::new(initial_pool_bitmap));
 
             // Initialize pool sequence numbers
