@@ -1,8 +1,23 @@
 """
 High-level Python API for ultrapubsub
 
+⚠️ IMPORTANT WARNING: DO NOT USE io_URING ⚠️
+
 This module provides a user-friendly interface for the ultrapubsub IPC system,
-simplifying the creation of publishers and subscribers for inter-process communication.
+simplifying the creation of publishers and subscribers for inter-process communication
+using Shared Memory Ring Buffer with atomic operations.
+
+CRITICAL: The io_uring-based approach has been deprecated and abandoned due to
+fundamental architectural issues. All implementations MUST use the Shared Memory
+Ring Buffer approach described in the specifications.
+
+Why io_uring Failed:
+- io_uring operations submitted successfully but generated zero completions
+- Complex ring sharing between processes proved unreliable
+- Kernel completion ring mechanism unsuitable for message passing
+- Unpredictable behavior under high-frequency messaging scenarios
+
+Current Implementation: Shared Memory Ring Buffer with atomic operations only
 """
 
 import os
