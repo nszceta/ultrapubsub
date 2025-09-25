@@ -40,11 +40,29 @@ def decode_array_info(array):
     return timestamp, index, "OK"
 
 def subscriber_process(subscriber_id, test_name, duration):
-    """Independent subscriber process for receiving numpy arrays"""
+    """Completely independent subscriber process for receiving numpy arrays"""
     try:
-        # Create subscriber in this process
-        shm = SharedMemory(test_name)
-        subscriber = shm.create_subscriber()
+        print(f"  📡 Sub {subscriber_id}: Starting independent process...")
+
+        # Wait for publisher to create shared memory
+        print(f"  📡 Sub {subscriber_id}: Waiting for shared memory to be available...")
+        max_attempts = 30  # 30 seconds max wait
+        attempts = 0
+
+        while attempts < max_attempts:
+            try:
+                # Try to create subscriber
+                print(f"  📡 Sub {subscriber_id}: Attempting to create subscriber with ID {subscriber_id}")
+                shm = SharedMemory(test_name)
+                subscriber = shm.create_subscriber_with_id(subscriber_id)
+                print(f"  📡 Sub {subscriber_id}: Subscriber {subscriber_id} created successfully")
+                break
+            except Exception as e:
+                attempts += 1
+                if attempts >= max_attempts:
+                    raise Exception(f"Failed to connect to shared memory after {max_attempts} attempts: {e}")
+                print(f"  📡 Sub {subscriber_id}: Waiting for publisher (attempt {attempts}/{max_attempts})...")
+                time.sleep(1.0)
 
         received = 0
         latencies = []

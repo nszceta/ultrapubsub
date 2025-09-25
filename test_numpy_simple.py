@@ -4,14 +4,9 @@ Optimized numpy array test with independent subscriber processes for maximum del
 """
 import sys
 import time
-import ctypes
 import os
-import multiprocessing
 import numpy as np
-from datetime import datetime
 sys.path.insert(0, '.')
-
-from ultrapubsub import SharedMemory
 
 # Test configuration - exactly 35MB
 ARRAY_SHAPE = (3480, 3480, 3)  # 3480*3480*3 = 36,331,200 bytes (~35MB)
@@ -94,9 +89,25 @@ def main():
 
     test_name = "numpy_optimized_test"
 
-    # Start subscriber processes first
-    print(f"\n📡 Starting {SUBSCRIBER_COUNT} subscriber processes...")
+    # Start publisher process first
+    print(f"\n📤 Starting publisher process...")
     import subprocess
+    publisher_process = subprocess.Popen(
+        ['uv', 'run', 'python', 'publisher_process.py', test_name, str(TEST_DURATION)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        universal_newlines=True,
+        env=os.environ.copy(),
+        cwd=os.getcwd()
+    )
+
+    # Give publisher time to start and create shared memory
+    time.sleep(2.0)
+
+    # Start subscriber processes (all completely independent)
+    print(f"\n📡 Starting {SUBSCRIBER_COUNT} independent subscriber processes...")
     subscriber_processes = []
 
     for i in range(SUBSCRIBER_COUNT):
@@ -104,7 +115,7 @@ def main():
         env['PYTHONPATH'] = '.'
 
         process = subprocess.Popen(
-            ['uv', 'run', 'python', 'subscriber_process.py', str(i), test_name, str(TEST_DURATION + 2)],
+            ['uv', 'run', 'python', 'subscriber_process.py', str(i), test_name, str(TEST_DURATION + 3)],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -114,56 +125,24 @@ def main():
             cwd=os.getcwd()
         )
         subscriber_processes.append(process)
-        time.sleep(0.1)  # Stagger process starts
+        time.sleep(0.2)  # Stagger process starts
 
-    # Give subscribers time to initialize
-    time.sleep(0.5)
+    print(f"\n⏳ All processes started, waiting for completion...")
 
-    # Create publisher
-    print(f"\n📤 Creating publisher...")
-    shm = SharedMemory(test_name)
-    publisher = shm.create_publisher()
+    # Wait for publisher process to finish and collect results
+    print(f"\n⏳ Waiting for publisher process to complete...")
+    publisher_result = None
+    while True:
+        output = publisher_process.stdout.readline()
+        if output == '' and publisher_process.poll() is not None:
+            break
+        if output:
+            print(output.strip())
+            result = parse_result_line(output.strip())
+            if result and result.get('process_type') == 'publisher':
+                publisher_result = result
 
-    # Start publishing
-    print(f"\n📤 Starting publisher...")
-    start_time = time.time()
-    count = 0
-    sequences = []
-
-    last_report_time = start_time
-    report_interval = 1.0
-
-    try:
-        while time.time() - start_time < TEST_DURATION:
-            # Create test array with current timestamp
-            test_array = create_test_array(count)
-
-            # Allocate pool slot
-            slot, ptr = publisher.allocate_pool_slot()
-
-            # Copy numpy array directly to pool slot
-            pool_mem = ctypes.cast(ptr, ctypes.POINTER(ctypes.c_char * array_size))
-            array_ptr = test_array.ctypes.data_as(ctypes.POINTER(ctypes.c_char * array_size))
-            ctypes.memmove(pool_mem, array_ptr, array_size)
-
-            # Publish the pool slot
-            seq = publisher.publish_pool_slot(slot, array_size)
-            sequences.append((seq, count, time.time()))
-            count += 1
-
-            # Report progress
-            current_time = time.time()
-            if current_time - last_report_time >= report_interval:
-                elapsed = current_time - start_time
-                freq = count / elapsed
-                throughput = (count * array_size) / elapsed / 1024 / 1024  # MB/s
-                print(f"  📈 Progress: {count} arrays, {freq:.1f} Hz, {throughput:.1f} MB/s")
-                last_report_time = current_time
-
-            # No polling in main thread - subscriber processes handle receiving
-
-    except Exception as e:
-        print(f"❌ Publisher error: {e}")
+    publisher_process.wait()
 
     # Wait for subscriber processes to finish
     print(f"\n⏳ Waiting for subscriber processes to complete...")
@@ -178,21 +157,20 @@ def main():
             if output:
                 print(output.strip())
                 result = parse_result_line(output.strip())
-                if result:
+                if result and result.get('subscriber_id') is not None:
                     subscriber_results.append(result)
 
         process.wait()
 
-    # Final publisher stats
-    total_time = time.time() - start_time
-    avg_frequency = count / total_time if total_time > 0 else 0
-    throughput = (count * array_size) / total_time / 1024 / 1024
-
-    print(f"\n📤 Publisher Results:")
-    print(f"   Arrays sent: {count}")
-    print(f"   Duration: {total_time:.2f}s")
-    print(f"   Frequency: {avg_frequency:.1f} Hz")
-    print(f"   Throughput: {throughput:.1f} MB/s")
+    # Print publisher results
+    if publisher_result:
+        print(f"\n📤 Publisher Results:")
+        print(f"   Arrays sent: {publisher_result.get('arrays_sent', 0)}")
+        print(f"   Duration: {publisher_result.get('duration', 0):.2f}s")
+        print(f"   Frequency: {publisher_result.get('frequency', 0):.1f} Hz")
+        print(f"   Throughput: {publisher_result.get('throughput', 0):.1f} MB/s")
+    else:
+        print(f"\n📤 Publisher Results: No publisher results received")
 
     # Fill in missing results
     while len(subscriber_results) < SUBSCRIBER_COUNT:
@@ -238,10 +216,15 @@ def main():
               f"avg: {avg_lat:.1f}ms, P95: {p95_lat:.1f}ms, rate: {msg_rate:.1f} Hz {status}")
 
     # Overall analysis
+    arrays_sent = publisher_result.get('arrays_sent', 0) if publisher_result else 0
     print(f"\n📊 Overall Performance:")
-    print(f"   Total arrays sent: {count}")
+    print(f"   Total arrays sent: {arrays_sent}")
     print(f"   Total arrays received: {total_received}")
-    print(f"   Delivery rate: {(total_received/(count*SUBSCRIBER_COUNT)*100):.1f}%")
+    if arrays_sent > 0:
+        delivery_rate = (total_received/(arrays_sent*SUBSCRIBER_COUNT)*100)
+        print(f"   Delivery rate: {delivery_rate:.1f}%")
+    else:
+        print(f"   Delivery rate: 0.0%")
     print(f"   Total errors: {total_errors}")
 
     if all_latencies:
@@ -269,15 +252,19 @@ def main():
 
     # Target analysis
     target_freq = 40.0
+    achieved_freq = publisher_result.get('frequency', 0) if publisher_result else 0
     print(f"\n🎯 Target Analysis:")
     print(f"   Target: {target_freq} Hz")
-    print(f"   Achieved: {avg_frequency:.1f} Hz")
-    print(f"   Target achievement: {(avg_frequency/target_freq*100):.1f}%")
+    print(f"   Achieved: {achieved_freq:.1f} Hz")
+    if achieved_freq > 0:
+        print(f"   Target achievement: {(achieved_freq/target_freq*100):.1f}%")
+    else:
+        print(f"   Target achievement: 0.0%")
 
-    if avg_frequency >= target_freq:
+    if achieved_freq >= target_freq:
         print("   ✅ TARGET PERFORMANCE ACHIEVED!")
     else:
-        gap = target_freq - avg_frequency
+        gap = target_freq - achieved_freq
         print(f"   ❌ {gap:.1f} Hz below target")
 
     # Data integrity check
@@ -285,8 +272,8 @@ def main():
     print(f"\n🔒 Data Integrity: {'✅ PASS' if integrity_pass else '❌ FAIL'}")
 
     # System efficiency
-    if count > 0:
-        delivery_efficiency = (total_received / (count * SUBSCRIBER_COUNT)) * 100
+    if arrays_sent > 0:
+        delivery_efficiency = (total_received / (arrays_sent * SUBSCRIBER_COUNT)) * 100
         print(f"📈 System Efficiency: {delivery_efficiency:.1f}% delivery to all subscribers")
 
     print(f"\n✅ Test completed successfully!")

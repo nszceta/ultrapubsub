@@ -1,12 +1,12 @@
-// UltraPubSub - High Performance Shared Memory Ring Buffer Implementation
+// UltraPubSub - High Performance Shared Memory Broadcast Buffer Implementation
 //
-// This module implements a shared memory ring buffer with atomic operations
-// for zero-copy 1:N pub/sub messaging, replacing the previous flawed io_uring approach.
+// This module implements a shared memory broadcast buffer with atomic operations
+// for synchronous 1:N messaging, replacing the previous ring buffer approach.
 // This implementation achieves the target 1.4 GB/s throughput (35 MB payloads at 40 Hz).
 
-mod ring_buffer;
+mod broadcast_buffer;
 mod event_loop;
-use ring_buffer::{SharedRingBuffer, RingBufferPublisher, RingBufferSubscriber};
+use broadcast_buffer::{SharedBroadcastBuffer, BroadcastPublisher, BroadcastSubscriber};
 use event_loop::{PyEventLoop, add_event_loop_to_module};
 
 use pyo3::prelude::*;
@@ -14,19 +14,19 @@ use std::sync::atomic::Ordering;
 use nix::unistd::{fork, ForkResult, Pid};
 use nix::sys::wait::{waitpid, WaitStatus};
 
-// Publisher using Shared Memory Ring Buffer
+// Publisher using Shared Memory Broadcast Buffer
 pub struct Publisher {
-    inner: RingBufferPublisher,
-    buffer: *mut SharedRingBuffer,
+    inner: BroadcastPublisher,
+    buffer: *mut SharedBroadcastBuffer,
     name: String,
 }
 
 impl Publisher {
-    /// Create a new publisher with a shared memory ring buffer
+    /// Create a new publisher with a shared memory broadcast buffer
     pub fn new(name: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        // Create shared memory ring buffer
-        let buffer = SharedRingBuffer::create(name)?;
-        let inner = RingBufferPublisher::new(buffer);
+        // Create shared memory broadcast buffer
+        let buffer = SharedBroadcastBuffer::create(name)?;
+        let inner = BroadcastPublisher::new(buffer);
 
         Ok(Self {
             inner,
@@ -97,10 +97,10 @@ impl Drop for Publisher {
     }
 }
 
-// Subscriber using Shared Memory Ring Buffer
+// Subscriber using Shared Memory Broadcast Buffer
 pub struct Subscriber {
-    inner: RingBufferSubscriber,
-    buffer: *mut SharedRingBuffer,
+    inner: BroadcastSubscriber,
+    buffer: *mut SharedBroadcastBuffer,
     name: String,
     subscriber_id: usize,
 }
@@ -113,7 +113,21 @@ impl Subscriber {
 
         // For now, use subscriber ID 0 (could be enhanced to support multiple subscribers)
         let subscriber_id = 0;
-        let inner = RingBufferSubscriber::new(buffer, subscriber_id);
+        let inner = BroadcastSubscriber::new(buffer, subscriber_id);
+
+        Ok(Self {
+            inner,
+            buffer,
+            name: name.to_string(),
+            subscriber_id,
+        })
+    }
+
+    /// Create a new subscriber with a specific ID
+    pub fn with_id(name: &str, subscriber_id: usize) -> Result<Self, Box<dyn std::error::Error>> {
+        // Attach to existing shared memory ring buffer
+        let buffer = SharedRingBuffer::attach(name)?;
+        let inner = BroadcastSubscriber::new(buffer, subscriber_id);
 
         Ok(Self {
             inner,
@@ -328,6 +342,16 @@ impl PySubscriber {
         }
     }
 
+    pub fn initialize_with_id(&mut self, subscriber_id: usize) -> PyResult<()> {
+        match Subscriber::with_id(&self.name, subscriber_id) {
+            Ok(subscriber) => {
+                self.inner = Some(subscriber);
+                Ok(())
+            }
+            Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())),
+        }
+    }
+
     pub fn receive(&mut self) -> PyResult<Vec<u8>> {
         match &mut self.inner {
             Some(subscriber) => subscriber.receive()
@@ -409,6 +433,13 @@ pub fn create_subscriber(name: String) -> PyResult<PySubscriber> {
 }
 
 #[pyfunction]
+pub fn create_subscriber_with_id(name: String, subscriber_id: usize) -> PyResult<PySubscriber> {
+    let mut subscriber = PySubscriber::new(name)?;
+    subscriber.initialize_with_id(subscriber_id)?;
+    Ok(subscriber)
+}
+
+#[pyfunction]
 pub fn create_publisher(name: String) -> PyResult<PyPublisher> {
     PyPublisher::new(name)
 }
@@ -427,6 +458,7 @@ fn ultrapubsub(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySubscriber>()?;
     m.add_class::<PyEventLoop>()?;
     m.add_function(wrap_pyfunction!(create_subscriber, m)?)?;
+    m.add_function(wrap_pyfunction!(create_subscriber_with_id, m)?)?;
     m.add_function(wrap_pyfunction!(create_publisher, m)?)?;
     m.add_function(wrap_pyfunction!(cleanup_shared_memory, m)?)?;
     add_event_loop_to_module(m)?;

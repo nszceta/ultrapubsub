@@ -85,6 +85,18 @@ class SharedMemory:
             self._subscriber = Subscriber(self.name)
         return self._subscriber
 
+    def create_subscriber_with_id(self, subscriber_id: int) -> 'Subscriber':
+        """
+        Create a subscriber with a specific ID for this shared memory region.
+
+        Args:
+            subscriber_id: Unique ID for this subscriber
+
+        Returns:
+            Subscriber instance with the specified ID
+        """
+        return Subscriber.with_id(self.name, subscriber_id)
+
 
 class Publisher:
     """
@@ -278,6 +290,23 @@ class Subscriber:
         """
         self._subscriber = PySubscriber(name)
         self._subscriber.initialize()
+
+    @classmethod
+    def with_id(cls, name: str, subscriber_id: int) -> 'Subscriber':
+        """
+        Create a subscriber with a specific ID.
+
+        Args:
+            name: Name for the shared memory region
+            subscriber_id: Unique ID for this subscriber
+
+        Returns:
+            Subscriber instance with the specified ID
+        """
+        from ultrapubsub import create_subscriber_with_id
+        instance = cls.__new__(cls)
+        instance._subscriber = create_subscriber_with_id(name, subscriber_id)
+        return instance
 
     def receive(self, timeout: Optional[float] = None) -> Optional[bytes]:
         """
