@@ -2,7 +2,6 @@
 //
 // This module implements a shared memory broadcast buffer with atomic operations
 // for synchronous 1:N messaging, replacing the previous ring buffer approach.
-// This implementation achieves the target 1.4 GB/s throughput (35 MB payloads at 40 Hz).
 
 mod broadcast_buffer;
 mod event_loop;

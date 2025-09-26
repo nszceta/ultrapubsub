@@ -64,6 +64,13 @@ The system must handle large data packets (typically about 35 MB) at high freque
 - **Real-time Requirements**: Must maintain 40 Hz timing under all conditions
 - **Zero-Copy**: Minimize memory copies, especially for large NumPy arrays
 
+**Tools and Commands:**
+- Build: `maturin develop`
+- Spec management: `openspec list`, `openspec validate`, `openspec show`
+
+Use uv extensively when dealing with Python code. Use `uv add` to add packages to the local virtual environment and launch python scripts with `uv run`
+
+
 ## External Dependencies
 - **PyO3**: Rust bindings for Python to create seamless Python APIs
 - **Astral uv**: Python package and environment management

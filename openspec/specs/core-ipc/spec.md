@@ -2,7 +2,7 @@
 
 ## Purpose
 
-The Core IPC capability provides high-performance inter-process communication using Shared Memory Ring Buffer with atomic operations. It enables zero-copy message passing between processes with lock-free synchronization and support for large binary data transmission at 1.4 GB/s throughput (35 MB payloads at 40 Hz).
+The Core IPC capability provides high-performance inter-process communication using Shared Memory Ring Buffer with atomic operations. It enables zero-copy message passing between processes with lock-free synchronization and support for large binary data transmission at least 1 GB/s throughput.
 
 ## Overview
 

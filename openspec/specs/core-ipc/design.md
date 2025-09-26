@@ -281,7 +281,7 @@ struct BlobSignature {
 ### Integration Tests
 - **Multi-Process**: Test fork/exec, shared memory attachment
 - **Large Data**: Test 35MB blob generation, verification
-- **Performance**: Test 40Hz frequency, 1.4GB/s throughput metrics
+- **Performance**: Test 40Hz frequency, at least GB/s throughput metrics
 - **Error Handling**: Test error conditions, recovery
 - **Zero-Copy**: Test pre-allocated pool operations
 

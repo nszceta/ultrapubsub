@@ -1,10 +1,3 @@
-
-**Tools and Commands:**
-- Build: `maturin develop`
-- Spec management: `openspec list`, `openspec validate`, `openspec show`
-
-Use uv extensively when dealing with Python code. Use `uv add` to add packages to the local virtual environment and launch python scripts with `uv run`
-
 <!-- OPENSPEC:START -->
 # OpenSpec Instructions
 
