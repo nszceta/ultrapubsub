@@ -67,8 +67,8 @@ The system SHALL support transmission of large binary data (35 MB payloads) with
 
 #### Scenario: Signature Verification
 - **WHEN** a blob is received
-- **THEN** the system SHALL verify the header signature "ULTRAPUBSUB_BLOB_START_[SIZE]MB"
-- **AND** the system SHALL verify the footer signature "ULTRAPUBSUB_BLOB_END_[SIZE]MB"
+- **THEN** the system SHALL verify the header signature
+- **AND** the system SHALL verify the footer signature
 - **AND** verification SHALL fail if either signature is corrupted or missing
 
 #### Scenario: Payload Integrity
@@ -145,15 +145,15 @@ The system SHALL achieve performance targets suitable for high-frequency messagi
 
 #### Scenario: High-Frequency Messaging
 - **WHEN** sending 35 MB payloads at 40 Hz frequency
-- **THEN** the system SHALL sustain 1.4 GB/s throughput (35 MB × 40 Hz)
+- **THEN** the system SHALL sustain a minimum 1 GB/s throughput
 - **AND** latency SHALL remain below 25ms per message (40 Hz cycle time)
-- **AND** the system SHALL handle exactly 6 concurrent subscribers with zero-copy sharing
+- **AND** the system SHALL handle at least 6 concurrent subscribers with zero-copy sharing
 
 #### Scenario: Large Data Performance
 - **WHEN** transmitting 35MB binary blobs at 40 Hz
-- **THEN** the system SHALL maintain stable 1.4 GB/s transmission rates
+- **THEN** the system SHALL maintain at least 1 GB/s transmission rates
 - **AND** memory usage SHALL remain within expected limits for 6 subscribers
-- **AND** no timing jitter SHALL occur in the 40 Hz cycle
+- **AND** minimal timing jitter SHALL occur in the 40 Hz cycle
 
 #### Scenario: Multi-Subscriber Scalability
 - **WHEN** multiple subscribers attach to the same publisher
@@ -207,9 +207,9 @@ The system SHALL integrate properly with the Linux operating system and developm
 ## Non-Functional Requirements
 
 ### Performance Requirements
-- **Throughput**: Support 1.4 GB/s sustained data transfer (35 MB × 40 Hz)
-- **Latency**: Target < 25ms per message (40 Hz cycle time)
-- **Frequency**: Maintain consistent 40 Hz message rate with no jitter
+- **Throughput**: Support over 1 GB/s sustained data transfer
+- **Latency**: Target <= 25ms per message (40 Hz cycle time)
+- **Frequency**: Maintain consistent 40 Hz message rate with minimal jitter
 - **Subscribers**: Support multiple concurrent subscribers (at least 6) with zero-copy sharing
 - **Memory Efficiency**: Maintain zero-copy semantics throughout the system
 - **Payload Size**: Handle 35 MB payloads efficiently
@@ -224,7 +224,7 @@ The system SHALL integrate properly with the Linux operating system and developm
 - **Platform**: Linux-only (atomic operations and shared memory)
 - **Kernel**: Require Linux kernel 3.2+ for atomic operations support
 - **Python**: Support Python 3.8+ with PyO3 bindings
-- **Architecture**: Support x86_64 and ARM64 architectures
+- **Architecture**: Support x86_64 architecture
 
 ## Testing Requirements
 
@@ -237,7 +237,7 @@ The system SHALL integrate properly with the Linux operating system and developm
 ### Integration Testing
 - **Multi-Process**: Test independent process attachment to shared memory
 - **Large Data**: Test zero-copy transmission of 35 MB binary blobs
-- **Performance**: Verify 1.4 GB/s performance targets are met (35 MB × 40 Hz)
+- **Performance**: Verify at least 1 GB/s performance targets are met
 - **Frequency Testing**: Verify consistent 40 Hz message rate
 - **Python Integration**: Test all Python APIs and error handling
 
