@@ -1,7 +1,7 @@
 [project]
 name = "ultrapubsub"
 version = "0.1.0"
-description = "Ultra-fast pub/sub using io_uring and shared memory"
+description = "Ultra-fast synchronous broadcast using shared memory"
 authors = [
     {name = "ultrapubsub team"}
 ]

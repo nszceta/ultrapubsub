@@ -1,24 +1,12 @@
 # Core IPC Specification
 
-## ⚠️ Important Warning: Do NOT Use io_uring
-
-**CRITICAL**: The io_uring-based approach has been deprecated and abandoned due to fundamental architectural issues. All implementations MUST use the Shared Memory Ring Buffer approach described in this specification.
-
-**Why io_uring Failed**:
-- io_uring operations submitted successfully but generated zero completions
-- Complex ring sharing between processes proved unreliable
-- Kernel completion ring mechanism unsuitable for message passing
-- Unpredictable behavior under high-frequency messaging scenarios
-
-**Current Implementation**: Shared Memory Ring Buffer with atomic operations only
-
 ## Purpose
 
 The Core IPC capability provides high-performance inter-process communication using Shared Memory Ring Buffer with atomic operations. It enables zero-copy message passing between processes with lock-free synchronization and support for large binary data transmission at 1.4 GB/s throughput (35 MB payloads at 40 Hz).
 
 ## Overview
 
-This specification defines the requirements for implementing a complete Shared Memory Ring Buffer-based IPC system that replaces the previous flawed io_uring-based implementation with true zero-copy, lock-free multi-process communication achieving maximum performance targets.
+This specification defines the requirements for implementing a complete Shared Memory Ring Buffer-based IPC system implements true zero-copy, lock-free multi-process communication achieving maximum performance targets.
 
 ## Requirements
 

@@ -1,22 +1,16 @@
 # Project Context
 
 ## Purpose
-The purpose of the library is to create the fastest possible publish/subscribe message system on modern Linux machines.
+The purpose of the library is to create the fastest possible synchronous broadcast message for modern Linux machines.
 
 Current implementations of fast publish/subscribe technologies like pynng do not go far enough to both guarantee message delivery to subscribers and reduce the number of memory copies and syscalls.
 
-The system must handle large data packets (typically ~33 MB, 20 MB in testing) at high frequency (40 Hz) with multiple concurrent subscribers (6 in test scenario), implementing sophisticated memory management and backpressure mechanisms.
-
-## Current Status
-**Performance**: 74MB/s achieved (up from 29MB/s baseline) - 90% below target of 800MB/s
-**Blocking Issue**: io_uring completion ring initialization prevents end-to-end IPC
-**Key Achievement**: 2000x subscriber polling efficiency improvement through event-driven processing
+The system must handle large data packets (typically about 35 MB) at high frequency (40 Hz) with multiple concurrent subscribers (6 in test scenario), implementing sophisticated memory management and backpressure mechanisms. These are examples and these values must never be hardcoded.
 
 ## Tech Stack
 - **Core Implementation**: Rust for performance and memory safety
 - **Language Bindings**: Python bindings using PyO3 for seamless integration
 - **Python Management**: Astral uv for Python dependency management and execution
-- **Kernel Interface**: io_uring for asynchronous I/O operations
 - **Memory Management**: Shared memory pools with reference counting
 - **Data Integration**: Zero-copy NumPy array handling using buffer protocol
 - **Performance Target**: 800 MB/s sustained throughput (20 MB × 40 Hz)
@@ -31,22 +25,21 @@ The system must handle large data packets (typically ~33 MB, 20 MB in testing) a
 - **Python Management**: Use astral uv for all Python operations (uv init, uv add, uv run)
 
 ### Architecture Patterns
-- **Zero-Copy Messaging**: Direct memory sharing between publisher and subscribers ✅ IMPLEMENTED
-- **Reference Counting**: Track buffer ownership across multiple subscribers ✅ IMPLEMENTED
-- **Memory Pool Management**: Dynamic allocation with pressure monitoring and backpressure ✅ IMPLEMENTED
-- **Event-Driven Processing**: io_uring-based blocking waits instead of polling ✅ IMPLEMENTED
-- **Completion Ring Sharing**: Multiple subscribers accessing same completion ring ❌ BLOCKED
+- **Zero-Copy Messaging**: Direct memory sharing between publisher and subscribers
+- **Reference Counting**: Track buffer ownership across multiple subscribers
+- **Memory Pool Management**: Dynamic allocation with pressure monitoring and backpressure
+- **Event-Driven Processing**: libuv based instead of polling
+- **Completion Ring Sharing**: Multiple subscribers accessing same completion ring
 - **Backpressure Propagation**: Progressive warnings → hard limits → data dropping
 
 ### Testing Strategy
-- **Performance Benchmark**: 20 MB packets at 40 Hz (800 MB/s) with 6 concurrent subscribers ⚠️ PARTIAL
-- **Memory Stress Testing**: Monitor buffer retention and warning system effectiveness ✅ COMPLETE
-- **Warning System Validation**: Verify progressive warnings before hard limits are reached ✅ COMPLETE
-- **Data Drop Scenarios**: Test graceful degradation when memory limits exceeded ✅ COMPLETE
-- **Latency Requirements**: Ensure 40 Hz timing is maintained under all load conditions ✅ COMPLETE
-- **Memory Safety**: Validate no double-free or use-after-free in multi-process scenarios ✅ COMPLETE
-- **IPC Communication**: Test end-to-end message passing ❌ BLOCKED by completion ring issue
-- **Completion Ring Validation**: Verify proper io_uring completion ring initialization ❌ BLOCKED
+- **Performance Benchmark**: 35 MB packets at 40 Hz with 6 concurrent subscribers
+- **Memory Stress Testing**: Monitor buffer retention and warning system effectiveness
+- **Warning System Validation**: Verify progressive warnings before hard limits are reache
+- **Data Drop Scenarios**: Test graceful degradation when memory limits exceeded
+- **Latency Requirements**: Ensure 40 Hz timing is maintained under all load conditions
+- **Memory Safety**: Validate no double-free or use-after-free in multi-process scenarios
+- **IPC Communication**: Test end-to-end message passing by completion ring issue
 
 ### Git Workflow
 - **Branching**: feature/ branches for new capabilities, fix/ for bug fixes
@@ -55,7 +48,6 @@ The system must handle large data packets (typically ~33 MB, 20 MB in testing) a
 - **Release**: Semantic versioning, breaking changes only when absolutely necessary
 
 ## Domain Context
-- **Linux Kernel io_uring**: Asynchronous I/O interface for high-performance operations
 - **Shared Memory IPC**: Zero-copy data transfer between processes using shared memory pools
 - **Memory Pressure Management**: Subscriber buffer monitoring and warning system
 - **Multi-subscriber Coordination**: 6 concurrent processes sharing memory pool with reference counting
@@ -63,7 +55,7 @@ The system must handle large data packets (typically ~33 MB, 20 MB in testing) a
 - **Backpressure Strategy**: Progressive warnings → hard limits → data dropping to maintain system stability
 
 ## Important Constraints
-- **Platform**: Linux-only (io_uring is Linux-specific)
+- **Platform**: Linux-only (libuv and Linux-specific shared memory semantics)
 - **Data Size**: Large packets (~33 MB typical, 20 MB in test scenario)
 - **Performance Target**: 40 Hz production rate with 6 concurrent subscribers (800 MB/s)
 - **Memory Management**: Warning system for subscriber buffer retention with progressive escalation
@@ -73,12 +65,9 @@ The system must handle large data packets (typically ~33 MB, 20 MB in testing) a
 - **Zero-Copy**: Minimize memory copies, especially for large NumPy arrays
 
 ## External Dependencies
-- **io_uring**: Linux kernel interface for asynchronous I/O operations
 - **PyO3**: Rust bindings for Python to create seamless Python APIs
 - **Astral uv**: Python package and environment management
 - **NumPy**: Buffer protocol integration for zero-copy array handling
 - **Memory Monitoring**: Linux memory tracking APIs for pressure detection
 - **Process Coordination**: Inter-process signaling for warning propagation
 - **Performance Counters**: High-resolution timing for 40 Hz validation and benchmarking
-
-The vendor/io-uring-ipc folder demonstrates an io_uring based IPC method. I would like to use its approach and lessons learned to implement my program, targeting similar performance (25.15 msgs/usec, 39.76 ns latency) but with much larger data packets and sophisticated memory management.

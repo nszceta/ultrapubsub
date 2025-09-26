@@ -1,49 +1,9 @@
-# Architecture Guidance
-
-## Current Architecture: Shared Memory Ring Buffer with Atomic Operations
-
-**Primary Technology Stack:**
-- **Shared Memory Ring Buffer** for zero-copy message passing
-- **Atomic Operations** for lock-free synchronization
-- **1:N Pub/Sub Model** with single publisher, multiple subscribers
-- **Zero-Copy Semantics** - subscribers read directly from publisher's memory
-
-**Key Performance Characteristics:**
-- **Throughput**: 1.4 GB/s (35 MB payloads at 40 Hz)
-- **Latency**: <25ms per message (40 Hz cycle time)
-- **Frequency**: Consistent 40 Hz message rate with no timing jitter
-- **Subscribers**: Support for multiple subscribers (at least 6) with zero-copy sharing
-- **CPU Overhead**: Minimal (atomic operations only)
-
-**Core Data Structures:**
-```rust
-struct SharedRingBuffer {
-    head: AtomicU64,                    // Publisher write position
-    tails: [AtomicU64; MAX_SUBSCRIBERS], // Per-subscriber read positions
-    data: [u8; BUFFER_SIZE],           // Circular message buffer
-    available: AtomicU64,               // Message availability bitmap
-}
-```
-
-**When Working on This Codebase:**
-1. **Always prioritize zero-copy design** - avoid unnecessary memory copies
-2. **Use atomic operations for synchronization** - no locks allowed
-3. **Optimize for 35 MB payload handling** - ensure efficient large block allocation
-4. **Maintain precise 40 Hz timing** - avoid jitter in message publishing
-5. **Support multiple subscribers** - ensure linear scaling to at least 6 subscribers
-6. **Consider NUMA effects** - allocate memory on optimal NUMA node
-7. **Profile memory bandwidth** - 1.4 GB/s is the target, monitor bottlenecks
-
-**Previous Architecture (Deprecated):**
-- ❌ **io_uring-based message passing** - failed due to completion ring issues
-- ❌ Complex ring sharing between processes - unreliable and complex
-- ❌ NOP operations for message queuing - kernel doesn't generate completions
 
 **Tools and Commands:**
 - Build: `maturin develop`
-- Test: `uv run python single_process_test.py`
 - Spec management: `openspec list`, `openspec validate`, `openspec show`
-- Architecture reference: See `openspec/specs/core-ipc/spec.md`
+
+Use uv extensively when dealing with Python code. Use `uv add` to add packages to the local virtual environment and launch python scripts with `uv run`
 
 <!-- OPENSPEC:START -->
 # OpenSpec Instructions

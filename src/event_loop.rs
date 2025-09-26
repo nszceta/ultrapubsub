@@ -8,7 +8,7 @@ use nix::sys::eventfd::{EventFd, EfdFlags};
 /// Simple event-driven notification system using eventfd
 #[pyclass]
 pub struct PyEventLoop {
-    subscriber_id: String,
+    _subscriber_id: String,
     event_fd: EventFd,
 }
 
@@ -22,7 +22,7 @@ impl PyEventLoop {
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
         Ok(Self {
-            subscriber_id,
+            _subscriber_id: subscriber_id,
             event_fd,
         })
     }

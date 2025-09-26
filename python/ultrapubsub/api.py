@@ -1,22 +1,6 @@
 """
 High-level Python API for ultrapubsub
 
-⚠️ IMPORTANT WARNING: DO NOT USE io_URING ⚠️
-
-This module provides a user-friendly interface for the ultrapubsub IPC system,
-simplifying the creation of publishers and subscribers for inter-process communication
-using Shared Memory Ring Buffer with atomic operations.
-
-CRITICAL: The io_uring-based approach has been deprecated and abandoned due to
-fundamental architectural issues. All implementations MUST use the Shared Memory
-Ring Buffer approach described in the specifications.
-
-Why io_uring Failed:
-- io_uring operations submitted successfully but generated zero completions
-- Complex ring sharing between processes proved unreliable
-- Kernel completion ring mechanism unsuitable for message passing
-- Unpredictable behavior under high-frequency messaging scenarios
-
 Current Implementation: Shared Memory Ring Buffer with atomic operations only
 """
 
@@ -116,23 +100,38 @@ class Publisher:
         self._publisher = PyPublisher(name)
         self._publisher.initialize()
 
-    def publish(self, data: bytes) -> int:
+    def broadcast(self, data: bytes) -> int:
         """
-        Publish data to shared memory.
+        Broadcast data to all subscribers synchronously.
 
         Args:
-            data: Bytes data to publish
+            data: Bytes data to broadcast
 
         Returns:
-            Sequence number of the published message
+            Sequence number of the broadcast message
 
         Raises:
-            RuntimeError: If publishing fails
+            RuntimeError: If broadcasting fails
         """
         if not isinstance(data, bytes):
             raise TypeError("Data must be bytes")
 
-        return self._publisher.publish(data)
+        return self._publisher.broadcast(data)
+
+    def publish(self, data: bytes) -> int:
+        """
+        Alias for broadcast() for backwards compatibility.
+
+        Args:
+            data: Bytes data to broadcast
+
+        Returns:
+            Sequence number of the broadcast message
+
+        Raises:
+            RuntimeError: If broadcasting fails
+        """
+        return self.broadcast(data)
 
     def try_publish(self, data: bytes) -> bool:
         """
@@ -153,29 +152,60 @@ class Publisher:
         result = self._publisher.try_publish(data)
         return result is not None
 
-    def publish_string(self, text: str, encoding: str = 'utf-8') -> None:
+    def broadcast_string(self, text: str, encoding: str = 'utf-8') -> None:
         """
-        Publish a string message.
+        Broadcast a string message.
 
         Args:
-            text: String to publish
+            text: String to broadcast
             encoding: Text encoding (default: utf-8)
         """
-        self.publish(text.encode(encoding))
+        self.broadcast(text.encode(encoding))
 
-    def publish_json(self, obj: Any) -> None:
+    def publish_string(self, text: str, encoding: str = 'utf-8') -> None:
         """
-        Publish a JSON-serializable object.
+        Alias for broadcast_string() for backwards compatibility.
 
         Args:
-            obj: Object to serialize and publish
+            text: String to broadcast
+            encoding: Text encoding (default: utf-8)
+        """
+        self.broadcast_string(text, encoding)
+
+    def broadcast_json(self, obj: Any) -> None:
+        """
+        Broadcast a JSON-serializable object.
+
+        Args:
+            obj: Object to serialize and broadcast
 
         Raises:
             RuntimeError: If JSON serialization fails
         """
         import json
         json_str = json.dumps(obj)
-        self.publish_string(json_str)
+        self.broadcast_string(json_str)
+
+    def publish_json(self, obj: Any) -> None:
+        """
+        Alias for broadcast_json() for backwards compatibility.
+
+        Args:
+            obj: Object to serialize and broadcast
+
+        Raises:
+            RuntimeError: If JSON serialization fails
+        """
+        self.broadcast_json(obj)
+
+    def subscriber_count(self) -> int:
+        """
+        Get the current number of registered subscribers.
+
+        Returns:
+            Number of subscribers currently registered
+        """
+        return self._publisher.subscriber_count()
 
     def publish_batch(self, messages: list[bytes]) -> None:
         """
@@ -236,6 +266,15 @@ class Publisher:
             RuntimeError: If freeing fails
         """
         self._publisher.free_memory(ptr, size)
+
+    def cleanup(self) -> None:
+        """
+        Clean up shared memory resources.
+
+        This should be called when the publisher is no longer needed
+        to properly release shared memory resources.
+        """
+        self._publisher.cleanup()
 
     def allocate_pool_slot(self) -> tuple[int, int]:
         """
@@ -314,8 +353,6 @@ class Subscriber:
 
         Args:
             timeout: Timeout in seconds (default: None for no timeout)
-                     Note: The implementation now uses blocking io_uring behavior,
-                     so timeout may not be exact but should be respected approximately
 
         Returns:
             Received data as bytes, or None if timeout
@@ -323,23 +360,17 @@ class Subscriber:
         import time
         start_time = time.time()
 
-
-        # Use blocking event-driven behavior with timeout
-        while True:
-            # Try non-blocking receive first
-            try:
-                result = self._subscriber.try_receive()
-                if result:
-                    return result
-            except Exception as e:
-                pass
-
-            # Check timeout
+        # For synchronous broadcast, use blocking receive directly
+        try:
+            # For broadcast buffer, receive() blocks until message is available
+            result = self._subscriber.receive()
+            return result
+        except Exception as e:
+            # If there's an error, check if we should timeout
             if timeout and (time.time() - start_time) > timeout:
                 return None
-
-            # Small sleep to avoid busy waiting
-            time.sleep(0.001)  # 1ms sleep
+            # Re-raise the exception if not timeout
+            raise
 
         return None
 
@@ -416,6 +447,15 @@ class Subscriber:
         import json
         json_str = self.receive_string(timeout)
         return json.loads(json_str) if json_str else None
+
+    def deregister(self) -> None:
+        """
+        Deregister this subscriber from the broadcast system.
+
+        This should be called when the subscriber is no longer needed
+        to properly release resources and update the subscriber count.
+        """
+        self._subscriber.deregister()
 
     def listen(self, callback: Callable[[bytes], None], timeout: Optional[float] = None) -> None:
         """

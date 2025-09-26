@@ -10,15 +10,14 @@ use broadcast_buffer::{SharedBroadcastBuffer, BroadcastPublisher, BroadcastSubsc
 use event_loop::{PyEventLoop, add_event_loop_to_module};
 
 use pyo3::prelude::*;
-use std::sync::atomic::Ordering;
 use nix::unistd::{fork, ForkResult, Pid};
 use nix::sys::wait::{waitpid, WaitStatus};
 
 // Publisher using Shared Memory Broadcast Buffer
 pub struct Publisher {
     inner: BroadcastPublisher,
-    buffer: *mut SharedBroadcastBuffer,
-    name: String,
+    _buffer: *mut SharedBroadcastBuffer,
+    _name: String,
 }
 
 impl Publisher {
@@ -30,31 +29,14 @@ impl Publisher {
 
         Ok(Self {
             inner,
-            buffer,
-            name: name.to_string(),
+            _buffer: buffer,
+            _name: name.to_string(),
         })
     }
 
-    /// Publish a message to the ring buffer
-    pub fn publish(&mut self, data: &[u8]) -> Result<u64, Box<dyn std::error::Error>> {
-        // For 35MB payloads at 40 Hz, we need maximum performance
-        self.inner.publish(data)
-    }
-
-    /// Publish multiple messages in a batch for better performance
-    pub fn publish_batch(&mut self, messages: &[&[u8]]) -> Result<Vec<u64>, Box<dyn std::error::Error>> {
-        let mut sequences = Vec::with_capacity(messages.len());
-        for message in messages {
-            let seq = self.publish(message)?;
-            sequences.push(seq);
-        }
-        Ok(sequences)
-    }
-
-    /// Try to publish without blocking - returns immediately if buffer is full
-    pub fn try_publish(&mut self, data: &[u8]) -> Result<Option<u64>, Box<dyn std::error::Error>> {
-        // For 35MB payloads at 40 Hz, we need maximum performance
-        self.inner.try_publish(data)
+    /// Broadcast a message to all subscribers synchronously
+    pub fn broadcast(&mut self, data: &[u8]) -> Result<u64, Box<dyn std::error::Error>> {
+        self.inner.broadcast(data)
     }
 
     /// Get the number of registered subscribers
@@ -62,106 +44,82 @@ impl Publisher {
         self.inner.subscriber_count()
     }
 
-    /// Register a new subscriber
-    pub fn register_subscriber(&mut self) -> usize {
-        self.inner.register_subscriber()
-    }
-
-    /// Allocate and write directly to shared memory (zero-copy pattern)
-    pub fn allocate_and_publish<F>(&mut self, size: usize, writer: F) -> Result<u64, Box<dyn std::error::Error>>
-    where
-        F: FnOnce(&mut [u8]),
-    {
-        let mut data = vec![0u8; size];
-        writer(&mut data);
-        self.publish(&data)
-    }
-
-    /// Allocate a slot from the pre-allocated memory pool (zero-copy for large messages)
-    pub fn allocate_pool_slot(&mut self) -> Result<(usize, *mut u8), Box<dyn std::error::Error>> {
-        self.inner.allocate_pool_slot()
-    }
-
-    /// Publish a pre-allocated pool slot
-    pub fn publish_pool_slot(&mut self, slot: usize, size: usize) -> Result<u64, Box<dyn std::error::Error>> {
-        self.inner.publish_pool_slot(slot, size)
+    /// Wait for all subscribers to be ready
+    pub fn wait_for_subscribers(&self, expected_count: u32) -> Result<(), Box<dyn std::error::Error>> {
+        self.inner.wait_for_subscribers(expected_count)
     }
 }
 
 impl Drop for Publisher {
     fn drop(&mut self) {
         // Cleanup shared memory when publisher is dropped
-        unsafe {
-            SharedRingBuffer::destroy(self.buffer, &self.name);
-        }
+        let _ = broadcast_buffer::cleanup_shared_memory(&self._name);
     }
 }
 
 // Subscriber using Shared Memory Broadcast Buffer
 pub struct Subscriber {
     inner: BroadcastSubscriber,
-    buffer: *mut SharedBroadcastBuffer,
-    name: String,
-    subscriber_id: usize,
+    _buffer: *mut SharedBroadcastBuffer,
+    _name: String,
+    _subscriber_id: usize,
 }
 
 impl Subscriber {
     /// Create a new subscriber attaching to existing shared memory
     pub fn new(name: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        // Attach to existing shared memory ring buffer
-        let buffer = SharedRingBuffer::attach(name)?;
+        // Attach to existing shared memory broadcast buffer
+        let buffer = SharedBroadcastBuffer::connect(name)?;
 
-        // For now, use subscriber ID 0 (could be enhanced to support multiple subscribers)
+        // For broadcast, use subscriber ID 0 as default
         let subscriber_id = 0;
         let inner = BroadcastSubscriber::new(buffer, subscriber_id);
 
+        // Auto-register on creation
+        inner.register()?;
+
         Ok(Self {
             inner,
-            buffer,
-            name: name.to_string(),
-            subscriber_id,
+            _buffer: buffer,
+            _name: name.to_string(),
+            _subscriber_id: subscriber_id,
         })
     }
 
     /// Create a new subscriber with a specific ID
     pub fn with_id(name: &str, subscriber_id: usize) -> Result<Self, Box<dyn std::error::Error>> {
-        // Attach to existing shared memory ring buffer
-        let buffer = SharedRingBuffer::attach(name)?;
+        // Attach to existing shared memory broadcast buffer
+        let buffer = SharedBroadcastBuffer::connect(name)?;
         let inner = BroadcastSubscriber::new(buffer, subscriber_id);
+
+        // Auto-register on creation
+        inner.register()?;
 
         Ok(Self {
             inner,
-            buffer,
-            name: name.to_string(),
-            subscriber_id,
+            _buffer: buffer,
+            _name: name.to_string(),
+            _subscriber_id: subscriber_id,
         })
     }
 
-    /// Receive the next available message (blocking with timeout)
+    /// Receive the next available broadcast message (blocking)
     pub fn receive(&mut self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        // For high-frequency 40 Hz messaging, we implement efficient polling
-        let mut attempts = 0;
-        let max_attempts = 1000; // 1000 * 100us = 100ms timeout
-
-        while attempts < max_attempts {
-            if let Some(message) = self.inner.receive() {
-                return Ok(message);
-            }
-            // Small sleep to prevent busy-waiting
-            std::thread::sleep(std::time::Duration::from_micros(100));
-            attempts += 1;
-        }
-        Err("Timeout waiting for message".into())
+        self.inner.receive()
     }
 
     /// Try to receive a message without blocking
     pub fn try_receive(&mut self) -> Option<Vec<u8>> {
-        self.inner.receive()
+        if self.inner.has_new_message() {
+            self.inner.receive().ok()
+        } else {
+            None
+        }
     }
 
     /// Check if there are messages available
     pub fn has_messages(&self) -> bool {
-        self.inner.has_messages()
+        self.inner.has_new_message()
     }
 
     /// Get the last processed message sequence number
@@ -171,28 +129,10 @@ impl Subscriber {
 
     /// Get the subscriber ID
     pub fn subscriber_id(&self) -> usize {
-        self.subscriber_id
+        self._subscriber_id
     }
 
-    /// Set a prefix filter for this subscriber
-    pub fn set_prefix_filter(&mut self, prefix: &[u8]) {
-        self.inner.set_prefix_filter(prefix);
-    }
-
-    /// Set a size filter for this subscriber
-    pub fn set_size_filter(&mut self, min: usize, max: usize) {
-        self.inner.set_size_filter(min, max);
-    }
-
-    /// Remove the message filter
-    pub fn clear_filter(&mut self) {
-        self.inner.clear_filter();
-    }
-
-    /// Check if this subscriber has a filter
-    pub fn has_filter(&self) -> bool {
-        self.inner.has_filter()
-    }
+    // Removed filter methods - not applicable for synchronous broadcast
 }
 
 impl Drop for Subscriber {
@@ -251,30 +191,22 @@ impl PyPublisher {
 
     pub fn publish(&mut self, data: Vec<u8>) -> PyResult<u64> {
         match &mut self.inner {
-            Some(publisher) => publisher.publish(&data)
+            Some(publisher) => publisher.broadcast(&data)
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())),
             None => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Publisher not initialized")),
         }
     }
 
-    pub fn try_publish(&mut self, data: Vec<u8>) -> PyResult<Option<u64>> {
+    pub fn broadcast(&mut self, data: Vec<u8>) -> PyResult<u64> {
         match &mut self.inner {
-            Some(publisher) => publisher.try_publish(&data)
+            Some(publisher) => publisher.broadcast(&data)
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())),
             None => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Publisher not initialized")),
         }
     }
 
-    pub fn publish_batch(&mut self, messages: Vec<Vec<u8>>) -> PyResult<Vec<u64>> {
-        match &mut self.inner {
-            Some(publisher) => {
-                let message_refs: Vec<&[u8]> = messages.iter().map(|msg| msg.as_slice()).collect();
-                publisher.publish_batch(&message_refs)
-                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
-            }
-            None => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Publisher not initialized")),
-        }
-    }
+    // Removed try_publish - not applicable for synchronous broadcast
+    // Removed publish_batch - broadcast sends single message to all subscribers
 
     pub fn subscriber_count(&self) -> PyResult<usize> {
         match &self.inner {
@@ -283,37 +215,20 @@ impl PyPublisher {
         }
     }
 
-    pub fn allocate_and_publish(&mut self, size: usize, data: Vec<u8>) -> PyResult<u64> {
+    pub fn cleanup(&mut self) -> PyResult<()> {
         match &mut self.inner {
-            Some(publisher) => {
-                if data.len() != size {
-                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("Data size does not match requested size"));
-                }
-                publisher.publish(&data)
-                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+            Some(_publisher) => {
+                // For now, just drop the publisher which will clean up resources
+                self.inner = None;
+                Ok(())
             }
-            None => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Publisher not initialized")),
+            None => Ok(()), // Already cleaned up
         }
     }
 
-    pub fn allocate_pool_slot(&mut self) -> PyResult<(usize, usize)> {
-        match &mut self.inner {
-            Some(publisher) => {
-                let (slot, ptr) = publisher.inner.allocate_pool_slot()
-                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-                Ok((slot, ptr as usize))
-            }
-            None => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Publisher not initialized")),
-        }
-    }
-
-    pub fn publish_pool_slot(&mut self, slot: usize, size: usize) -> PyResult<u64> {
-        match &mut self.inner {
-            Some(publisher) => publisher.inner.publish_pool_slot(slot, size)
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())),
-            None => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Publisher not initialized")),
-        }
-    }
+    // Removed allocate_and_publish - not applicable for synchronous broadcast
+    // Removed allocate_pool_slot - not applicable for synchronous broadcast
+    // Removed publish_pool_slot - not applicable for synchronous broadcast
 }
 
 #[pyclass(unsendable)]
@@ -349,6 +264,26 @@ impl PySubscriber {
                 Ok(())
             }
             Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())),
+        }
+    }
+
+    pub fn register(&mut self) -> PyResult<()> {
+        match &mut self.inner {
+            Some(_subscriber) => {
+                // Registration is now handled automatically in BroadcastSubscriber::new
+                Ok(())
+            }
+            None => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Subscriber not initialized")),
+        }
+    }
+
+    pub fn deregister(&mut self) -> PyResult<()> {
+        match &mut self.inner {
+            Some(_subscriber) => {
+                // Deregistration is handled automatically in Drop
+                Ok(())
+            }
+            None => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Subscriber not initialized")),
         }
     }
 
@@ -388,42 +323,7 @@ impl PySubscriber {
         }
     }
 
-    pub fn set_prefix_filter(&mut self, prefix: Vec<u8>) -> PyResult<()> {
-        match &mut self.inner {
-            Some(subscriber) => {
-                subscriber.set_prefix_filter(&prefix);
-                Ok(())
-            }
-            None => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Subscriber not initialized")),
-        }
-    }
-
-    pub fn set_size_filter(&mut self, min_size: usize, max_size: usize) -> PyResult<()> {
-        match &mut self.inner {
-            Some(subscriber) => {
-                subscriber.set_size_filter(min_size, max_size);
-                Ok(())
-            }
-            None => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Subscriber not initialized")),
-        }
-    }
-
-    pub fn clear_filter(&mut self) -> PyResult<()> {
-        match &mut self.inner {
-            Some(subscriber) => {
-                subscriber.clear_filter();
-                Ok(())
-            }
-            None => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Subscriber not initialized")),
-        }
-    }
-
-    pub fn has_filter(&self) -> PyResult<bool> {
-        match &self.inner {
-            Some(subscriber) => Ok(subscriber.has_filter()),
-            None => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Subscriber not initialized")),
-        }
-    }
+    // Removed filter methods - not applicable for synchronous broadcast
 }
 
 // Utility functions for Python
@@ -447,7 +347,8 @@ pub fn create_publisher(name: String) -> PyResult<PyPublisher> {
 #[pyfunction]
 pub fn cleanup_shared_memory(name: String) -> PyResult<()> {
     // Attempt to clean up shared memory object
-    let _ = unsafe { SharedRingBuffer::destroy(std::ptr::null_mut(), &name) };
+    broadcast_buffer::cleanup_shared_memory(&name)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
     Ok(())
 }
 
@@ -468,7 +369,7 @@ fn ultrapubsub(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
 // Performance benchmarking utilities
 pub mod benchmark {
     use super::*;
-    use std::time::{Instant, Duration};
+    use std::time::Instant;
 
     /// Run a benchmark test with specified parameters
     pub fn run_benchmark(
@@ -496,7 +397,7 @@ pub mod benchmark {
         let mut sequences = Vec::new();
 
         for _ in 0..message_count {
-            let seq = publisher.publish(&test_data)?;
+            let seq = publisher.broadcast(&test_data)?;
             sequences.push(seq);
         }
 
@@ -565,7 +466,7 @@ pub mod benchmark {
 mod tests {
     use super::*;
     use std::thread;
-    use std::time::{Instant, Duration};
+    use std::time::Instant;
 
     #[test]
     fn test_basic_pub_sub() {

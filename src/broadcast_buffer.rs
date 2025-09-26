@@ -3,50 +3,42 @@
 // in the OpenSpec change proposal for synchronous 1:N messaging.
 
 use std::ptr;
-use std::sync::atomic::{AtomicU64, AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU32, Ordering};
 use std::os::fd::AsRawFd;
-use std::io::Write;
 use nix::sys::mman::{shm_open, shm_unlink};
 use nix::fcntl::OFlag;
 use nix::sys::stat::Mode;
 use nix::unistd::{ftruncate};
-use libc::{c_void, mmap, munmap, MAP_FAILED, PROT_READ, PROT_WRITE, MAP_SHARED};
+use libc::{mmap, MAP_FAILED, PROT_READ, PROT_WRITE, MAP_SHARED};
 
 // Constants for the synchronous broadcast implementation
-pub const MAX_SUBSCRIBERS: usize = 6;  // Exactly 6 concurrent subscribers for broadcast
 pub const BROADCAST_SLOT_SIZE: usize = 35 * 1024 * 1024;  // 35MB single broadcast slot
-pub const BROADCAST_STATES: usize = 3;  // PUBLISHING, WAITING, COMPLETED
+// Broadcast states
+pub const MAX_DYNAMIC_SUBSCRIBERS: usize = 32;  // Maximum supported dynamic subscribers
 
 // Broadcast states
 pub const STATE_PUBLISHING: u32 = 0;
 pub const STATE_WAITING: u32 = 1;
 pub const STATE_COMPLETED: u32 = 2;
 
-// Memory layout constants for synchronous broadcast
-pub const SUBSCRIBER_COUNT_OFFSET: usize = 0;
-pub const BROADCAST_STATE_OFFSET: usize = 4;
-pub const CURRENT_SEQUENCE_OFFSET: usize = 8;
-pub const BROADCAST_LENGTH_OFFSET: usize = 16;
-pub const SUBSCRIBER_ACK_OFFSET: usize = 20;  // 6 bits for subscriber acknowledgments
-pub const SUBSCRIBER_REGISTERED_OFFSET: usize = 24;  // 6 bits for registration status
-pub const BROADCAST_DATA_OFFSET: usize = 32;  // Start of 35MB broadcast data
 
 /// Shared memory broadcast buffer for synchronous 1:N messaging
 ///
 /// This struct implements a synchronous broadcast mechanism where:
 /// - All subscribers receive the SAME message from a single broadcast slot
 /// - Publisher waits for ALL subscribers to complete before continuing
-/// - Exactly 6 subscribers are supported with explicit registration/deregistration
+/// - Dynamic number of subscribers supported (up to 32) with explicit registration/deregistration
 ///
 /// Memory Layout:
 /// ```text
 /// +--------------------------+
-/// | subscriber_count: u32     | Number of registered subscribers (0-6)
+/// | subscriber_count: u32     | Number of registered subscribers (0-32)
 /// | broadcast_state: u32      | Current broadcast state (PUBLISHING/WAITING/COMPLETED)
 /// | sequence_number: u64      | Monotonically increasing sequence
 /// | broadcast_length: u32     | Length of current broadcast data
-/// | subscriber_ack_bits: u32  | 6 bits for subscriber acknowledgments
-/// | subscriber_reg_bits: u32  | 6 bits for subscriber registration status
+/// +--------------------------+
+/// | subscriber_ack_array[32]  | Boolean array for subscriber acknowledgments
+/// | subscriber_reg_array[32]  | Boolean array for subscriber registration status
 /// +--------------------------+
 /// | broadcast_data[35MB]     | Single broadcast slot accessible to all
 /// +--------------------------+
@@ -54,12 +46,15 @@ pub const BROADCAST_DATA_OFFSET: usize = 32;  // Start of 35MB broadcast data
 #[repr(C)]
 pub struct SharedBroadcastBuffer {
     // Synchronous broadcast state
-    subscriber_count: AtomicU32,        // Number of registered subscribers (0-6)
+    subscriber_count: AtomicU32,        // Number of registered subscribers (0-32)
     broadcast_state: AtomicU32,         // Current broadcast state
     sequence_number: AtomicU64,         // Monotonically increasing sequence number
     broadcast_length: AtomicU32,        // Length of data in broadcast slot
-    subscriber_ack_bits: AtomicU32,     // 6 bits: which subscribers have acknowledged
-    subscriber_reg_bits: AtomicU32,     // 6 bits: which subscribers are registered
+    max_subscriber_id: AtomicU32,       // Highest subscriber ID for optimization
+
+    // Dynamic subscriber tracking arrays
+    subscriber_ack_array: [AtomicU32; MAX_DYNAMIC_SUBSCRIBERS],  // Acknowledgment status per subscriber
+    subscriber_reg_array: [AtomicU32; MAX_DYNAMIC_SUBSCRIBERS],  // Registration status per subscriber
 
     // Single broadcast slot accessible to all subscribers
     broadcast_data: [u8; BROADCAST_SLOT_SIZE],  // 35MB single broadcast slot
@@ -88,7 +83,7 @@ impl SharedBroadcastBuffer {
         )?;
 
         // Set the size of the shared memory object
-        ftruncate(fd, total_size as i64)?;
+        ftruncate(&fd, total_size as i64)?;
 
         // Map the shared memory object into process address space
         let ptr = unsafe {
@@ -97,13 +92,13 @@ impl SharedBroadcastBuffer {
                 total_size,
                 PROT_READ | PROT_WRITE,
                 MAP_SHARED,
-                fd,
+                fd.as_raw_fd(),
                 0,
             )
         };
 
         if ptr == MAP_FAILED {
-            shm_unlink(&shm_name.as_bytes())?;
+            shm_unlink(shm_name.as_str())?;
             return Err("Failed to mmap shared memory".into());
         }
 
@@ -114,8 +109,13 @@ impl SharedBroadcastBuffer {
             ptr::write_volatile(&mut (*buffer).broadcast_state as *mut AtomicU32, AtomicU32::new(STATE_COMPLETED));
             ptr::write_volatile(&mut (*buffer).sequence_number as *mut AtomicU64, AtomicU64::new(0));
             ptr::write_volatile(&mut (*buffer).broadcast_length as *mut AtomicU32, AtomicU32::new(0));
-            ptr::write_volatile(&mut (*buffer).subscriber_ack_bits as *mut AtomicU32, AtomicU32::new(0));
-            ptr::write_volatile(&mut (*buffer).subscriber_reg_bits as *mut AtomicU32, AtomicU32::new(0));
+            ptr::write_volatile(&mut (*buffer).max_subscriber_id as *mut AtomicU32, AtomicU32::new(0));
+
+            // Initialize subscriber arrays
+            for i in 0..MAX_DYNAMIC_SUBSCRIBERS {
+                ptr::write_volatile(&mut (*buffer).subscriber_ack_array[i] as *mut AtomicU32, AtomicU32::new(0));
+                ptr::write_volatile(&mut (*buffer).subscriber_reg_array[i] as *mut AtomicU32, AtomicU32::new(0));
+            }
         }
 
         Ok(buffer)
@@ -146,7 +146,7 @@ impl SharedBroadcastBuffer {
                 total_size,
                 PROT_READ | PROT_WRITE,
                 MAP_SHARED,
-                fd,
+                fd.as_raw_fd(),
                 0,
             )
         };
@@ -160,79 +160,45 @@ impl SharedBroadcastBuffer {
 
     /// Register a new subscriber with the broadcast buffer
     pub fn register_subscriber(&self, subscriber_id: usize) -> Result<(), Box<dyn std::error::Error>> {
-        if subscriber_id >= MAX_SUBSCRIBERS {
-            return Err("Subscriber ID must be 0-5".into());
+        if subscriber_id >= MAX_DYNAMIC_SUBSCRIBERS {
+            return Err(format!("Subscriber ID must be 0-{}", MAX_DYNAMIC_SUBSCRIBERS - 1).into());
         }
 
-        let mask = 1 << subscriber_id;
-        let mut reg_bits = self.subscriber_reg_bits.load(Ordering::Acquire);
-
         // Check if already registered
-        if reg_bits & mask != 0 {
+        let current_reg = self.subscriber_reg_array[subscriber_id].load(Ordering::Acquire);
+        if current_reg != 0 {
             return Ok(());
         }
 
-        // Set the registration bit
-        loop {
-            let new_reg_bits = reg_bits | mask;
-            match self.subscriber_reg_bits.compare_exchange_weak(
-                reg_bits,
-                new_reg_bits,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(current) => reg_bits = current,
-            }
-        }
+        // Set registration status
+        self.subscriber_reg_array[subscriber_id].store(1, Ordering::Release);
 
         // Increment subscriber count
         self.subscriber_count.fetch_add(1, Ordering::AcqRel);
+
+        // Update maximum subscriber ID
+        let current_max = self.max_subscriber_id.load(Ordering::Acquire);
+        if subscriber_id as u32 > current_max {
+            self.max_subscriber_id.store(subscriber_id as u32, Ordering::Release);
+        }
         Ok(())
     }
 
     /// Deregister a subscriber from the broadcast buffer
     pub fn deregister_subscriber(&self, subscriber_id: usize) -> Result<(), Box<dyn std::error::Error>> {
-        if subscriber_id >= MAX_SUBSCRIBERS {
-            return Err("Subscriber ID must be 0-5".into());
+        if subscriber_id >= MAX_DYNAMIC_SUBSCRIBERS {
+            return Err(format!("Subscriber ID must be 0-{}", MAX_DYNAMIC_SUBSCRIBERS - 1).into());
         }
 
-        let mask = !(1 << subscriber_id);
-        let mut reg_bits = self.subscriber_reg_bits.load(Ordering::Acquire);
-
         // Check if already deregistered
-        if reg_bits & (1 << subscriber_id) == 0 {
+        let current_reg = self.subscriber_reg_array[subscriber_id].load(Ordering::Acquire);
+        if current_reg == 0 {
             return Ok(());
         }
 
-        // Clear the registration bit
-        loop {
-            let new_reg_bits = reg_bits & mask;
-            match self.subscriber_reg_bits.compare_exchange_weak(
-                reg_bits,
-                new_reg_bits,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(current) => reg_bits = current,
-            }
-        }
-
-        // Clear acknowledgment bit
-        let mut ack_bits = self.subscriber_ack_bits.load(Ordering::Acquire);
-        loop {
-            let new_ack_bits = ack_bits & mask;
-            match self.subscriber_ack_bits.compare_exchange_weak(
-                ack_bits,
-                new_ack_bits,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(current) => ack_bits = current,
-            }
-        }
+        // Clear registration and acknowledgment status
+        self.subscriber_reg_array[subscriber_id].store(0, Ordering::Release);
+        self.subscriber_ack_array[subscriber_id].store(0, Ordering::Release);
 
         // Decrement subscriber count
         self.subscriber_count.fetch_sub(1, Ordering::AcqRel);
@@ -297,7 +263,6 @@ impl BroadcastPublisher {
         unsafe {
             (*self.buffer).broadcast_state.store(STATE_PUBLISHING, Ordering::Release);
             (*self.buffer).broadcast_length.store(data.len() as u32, Ordering::Release);
-            (*self.buffer).subscriber_ack_bits.store(0, Ordering::Release);
         }
 
         // Copy data to broadcast slot
@@ -316,13 +281,35 @@ impl BroadcastPublisher {
         }
 
         // Wait for all subscribers to acknowledge
-        let expected_ack_bits = (1 << subscriber_count) - 1;
         loop {
-            let ack_bits = unsafe { (*self.buffer).subscriber_ack_bits.load(Ordering::Acquire) };
-            if ack_bits == expected_ack_bits {
+            let mut acknowledged_count = 0;
+            let max_id = unsafe { (*self.buffer).max_subscriber_id.load(Ordering::Acquire) } as usize;
+            let check_limit = if max_id == 0 { MAX_DYNAMIC_SUBSCRIBERS } else { max_id + 1 };
+
+            for i in 0..check_limit {
+                let is_registered = unsafe { (*self.buffer).subscriber_reg_array[i].load(Ordering::Acquire) };
+                let is_acknowledged = unsafe { (*self.buffer).subscriber_ack_array[i].load(Ordering::Acquire) };
+
+                if is_registered != 0 && is_acknowledged != 0 {
+                    acknowledged_count += 1;
+                }
+            }
+
+            if acknowledged_count == subscriber_count {
                 break;
             }
+
             std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        // Reset acknowledgment bits for next broadcast
+        let max_id = unsafe { (*self.buffer).max_subscriber_id.load(Ordering::Acquire) } as usize;
+        let check_limit = if max_id == 0 { MAX_DYNAMIC_SUBSCRIBERS } else { max_id + 1 };
+        for i in 0..check_limit {
+            let is_registered = unsafe { (*self.buffer).subscriber_reg_array[i].load(Ordering::Acquire) };
+            if is_registered != 0 {
+                unsafe { (*self.buffer).subscriber_ack_array[i].store(0, Ordering::Release); }
+            }
         }
 
         // Set state to COMPLETED
@@ -342,6 +329,12 @@ impl BroadcastPublisher {
         }
 
         Ok(())
+    }
+
+    /// Get the current number of registered subscribers
+    pub fn subscriber_count(&self) -> usize {
+        let buffer = unsafe { &*self.buffer };
+        buffer.get_subscriber_count() as usize
     }
 }
 
@@ -403,29 +396,12 @@ impl BroadcastSubscriber {
         }
 
         // Acknowledge receipt
-        let mask = 1 << self.subscriber_id;
-        let mut ack_bits = unsafe { (*self.buffer).subscriber_ack_bits.load(Ordering::Acquire) };
-        loop {
-            let new_ack_bits = ack_bits | mask;
-            match unsafe { (*self.buffer).subscriber_ack_bits.compare_exchange_weak(
-                ack_bits,
-                new_ack_bits,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) } {
-                Ok(_) => break,
-                Err(current) => ack_bits = current,
-            }
+        unsafe {
+            (*self.buffer).subscriber_ack_array[self.subscriber_id].store(1, Ordering::Release);
         }
 
         self.last_sequence = buffer.get_sequence_number();
         Ok(data)
-    }
-
-    /// Get the current sequence number
-    pub fn get_current_sequence(&self) -> u64 {
-        let buffer = unsafe { &*self.buffer };
-        buffer.get_sequence_number()
     }
 
     /// Check if a new message is available
@@ -435,6 +411,11 @@ impl BroadcastSubscriber {
         let sequence = buffer.get_sequence_number();
 
         state == STATE_WAITING && sequence > self.last_sequence
+    }
+
+    /// Get the last processed message sequence number
+    pub fn last_processed(&self) -> u64 {
+        self.last_sequence
     }
 }
 
@@ -453,6 +434,6 @@ pub fn cleanup_shared_memory(name: &str) -> Result<(), Box<dyn std::error::Error
         format!("/{}", name)
     };
 
-    shm_unlink(&shm_name.as_bytes())?;
+    shm_unlink(shm_name.as_str())?;
     Ok(())
 }
