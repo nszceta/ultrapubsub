@@ -1,61 +1,103 @@
 #!/usr/bin/env python3
 """
-Simple publisher process for UltraPubSub testing
+Simple publisher for futex performance test
 """
 import sys
 import time
 import ultrapubsub
+import json
+import os
 
-def main():
-    if len(sys.argv) != 3:
-        print("Usage: python publisher_process.py <test_name> <message_count>")
-        sys.exit(1)
-
-    test_name = sys.argv[1]
-    message_count = int(sys.argv[2])
-
-    print(f"Publisher process starting for test: {test_name}")
-
+def run_simple_publisher(test_name, message_size_mb, duration_seconds, target_hz):
+    """Run simple publisher test"""
     try:
-        # Clean up any existing shared memory
-        try:
-            ultrapubsub.cleanup_shared_memory(test_name)
-        except:
-            pass
+        # Create test message
+        test_message = b'X' * (message_size_mb * 1024 * 1024)
 
         # Create publisher
         publisher = ultrapubsub.create_publisher(test_name)
-        print("✅ Publisher created")
 
-        # Wait for subscribers to register
-        print("Waiting for subscribers to register...")
-        while publisher.subscriber_count() < 6:
-            print(f"Current subscriber count: {publisher.subscriber_count()}")
-            time.sleep(0.5)
+        # Wait for subscriber
+        max_wait = 10.0
+        wait_start = time.time()
+        while publisher.subscriber_count() == 0 and (time.time() - wait_start) < max_wait:
+            time.sleep(0.1)
 
-        print(f"✅ All 6 subscribers registered!")
+        if publisher.subscriber_count() == 0:
+            result = {
+                'type': 'publisher',
+                'error': 'No subscribers registered',
+                'message_count': 0,
+                'actual_hz': 0
+            }
+            print(json.dumps(result))
+            return 1
 
-        # Send messages
-        for i in range(message_count):
-            message = f"Message {i+1} from publisher".encode()
-            sequence = publisher.broadcast(message)
-            print(f"📤 Sent message {i+1}/{message_count} with sequence {sequence}")
-            time.sleep(0.1)  # Small delay between messages
+        # Start broadcasting
+        start_time = time.time()
+        end_time = start_time + duration_seconds
+        message_count = 0
 
-        print("✅ All messages sent!")
+        try:
+            while time.time() < end_time:
+                broadcast_start = time.time()
 
-        # Keep publisher alive for a bit longer
-        time.sleep(2)
+                # Broadcast message
+                publisher.broadcast(test_message)
+                message_count += 1
 
-        # Cleanup
-        ultrapubsub.cleanup_shared_memory(test_name)
-        print("✅ Cleanup completed")
+                # Maintain target frequency
+                actual_broadcast_time = time.time() - broadcast_start
+                cycle_time = 1.0 / target_hz
+                sleep_time = max(0, cycle_time - actual_broadcast_time)
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+
+        except Exception as e:
+            result = {
+                'type': 'publisher',
+                'error': str(e),
+                'message_count': message_count,
+                'actual_hz': 0
+            }
+            print(json.dumps(result))
+            return 1
+
+        # Calculate results
+        actual_duration = time.time() - start_time
+        actual_hz = message_count / actual_duration if actual_duration > 0 else 0
+
+        result = {
+            'type': 'publisher',
+            'message_count': message_count,
+            'duration': actual_duration,
+            'actual_hz': actual_hz,
+            'target_hz': target_hz,
+            'subscribers': publisher.subscriber_count(),
+            'pid': os.getpid()
+        }
+
+        print(json.dumps(result))
+        return 0
 
     except Exception as e:
-        print(f"❌ Publisher error: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+        result = {
+            'type': 'publisher',
+            'error': str(e),
+            'message_count': 0,
+            'actual_hz': 0
+        }
+        print(json.dumps(result))
+        return 1
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) != 5:
+        print(json.dumps({'error': 'Usage: python simple_publisher.py <test_name> <message_size_mb> <duration_seconds> <target_hz>'}))
+        sys.exit(1)
+
+    test_name = sys.argv[1]
+    message_size_mb = int(sys.argv[2])
+    duration_seconds = int(sys.argv[3])
+    target_hz = float(sys.argv[4])
+
+    sys.exit(run_simple_publisher(test_name, message_size_mb, duration_seconds, target_hz))

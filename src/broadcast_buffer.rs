@@ -28,12 +28,7 @@ use libc::{
 // Debug macro for stdout flushing (required for PyO3 debug output)
 macro_rules! debug_print {
     ($($arg:tt)*) => {
-        {
-            print!("[DEBUG] ");
-            print!($($arg)*);
-            print!("\n");
-            io::stdout().flush().unwrap();
-        }
+        // Disabled for performance testing
     };
 }
 
