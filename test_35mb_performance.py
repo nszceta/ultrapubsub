@@ -24,78 +24,7 @@ def run_35mb_performance_test():
     except:
         pass
 
-    # Start subscriber in background
-    subscriber_cmd = ['python', '-c', f'''
-import ultrapubsub
-import time
-import json
-import os
-
-# Create subscriber
-subscriber = ultrapubsub.create_subscriber_with_id("{test_name}", 0)
-subscriber.register()
-
-print("Subscriber ready for 35MB messages...")
-
-# Receive messages
-start_time = time.time()
-messages_received = 0
-total_bytes = 0
-latencies = []
-
-while time.time() - start_time < {duration_seconds}:
-    msg_start = time.time()
-    try:
-        msg = subscriber.receive(timeout=1.0)
-        if msg:
-            msg_end = time.time()
-            messages_received += 1
-            total_bytes += len(msg)
-            latencies.append((msg_end - msg_start) * 1000)
-
-            # Log progress every 5 messages
-            if messages_received % 5 == 0:
-                elapsed = time.time() - start_time
-                current_hz = messages_received / elapsed
-                current_mbps = (total_bytes / elapsed) / (1024 * 1024)
-                avg_latency = sum(latencies[-5:]) / min(5, len(latencies))
-                print(f"Received {{messages_received}}: {{len(msg)/1024/1024:.1f}}MB, {{current_hz:.1f}} Hz, {{current_mbps:.1f}} MB/s, {{avg_latency:.1f}}ms")
-    except:
-        # Timeout expected
-        pass
-
-# Calculate final results
-duration = time.time() - start_time
-avg_latency = sum(latencies) / len(latencies) if latencies else 0
-actual_hz = messages_received / duration
-throughput_mbps = (total_bytes / duration) / (1024 * 1024)
-throughput_gbps = throughput_mbps / 1024
-
-result = {{
-    "type": "subscriber",
-    "messages_received": messages_received,
-    "total_bytes": total_bytes,
-    "total_mb": total_bytes / (1024 * 1024),
-    "duration": duration,
-    "actual_hz": actual_hz,
-    "target_hz": {target_hz},
-    "avg_latency_ms": avg_latency,
-    "throughput_mbps": throughput_mbps,
-    "throughput_gbps": throughput_gbps,
-    "efficiency": (actual_hz / {target_hz}) * 100,
-    "target_throughput_mbps": 1.4 * 1024,  # 1.4 GB/s target
-    "target_efficiency": (throughput_mbps / (1.4 * 1024)) * 100
-}}
-
-print(json.dumps(result))
-''']
-
-    subscriber_proc = subprocess.Popen(subscriber_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-
-    # Give subscriber time to start
-    time.sleep(2)
-
-    # Start publisher
+    # Start publisher first to create shared memory
     publisher_cmd = ['python', '-c', f'''
 import ultrapubsub
 import time
@@ -174,6 +103,80 @@ print(json.dumps(result))
 ''']
 
     publisher_proc = subprocess.Popen(publisher_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    # Give publisher time to create shared memory
+    time.sleep(1)
+
+    # Start subscriber
+    subscriber_cmd = ['python', '-c', f'''
+import ultrapubsub
+import time
+import json
+import os
+
+# Create subscriber
+subscriber = ultrapubsub.create_subscriber_with_id("{test_name}", 0)
+subscriber.register()
+
+print("Subscriber ready for 35MB messages...")
+
+# Receive messages
+start_time = time.time()
+messages_received = 0
+total_bytes = 0
+latencies = []
+
+while time.time() - start_time < {duration_seconds}:
+    msg_start = time.time()
+    try:
+        msg = subscriber.receive(timeout=1.0)
+        if msg:
+            msg_end = time.time()
+            messages_received += 1
+            total_bytes += len(msg)
+            latencies.append((msg_end - msg_start) * 1000)
+
+            # Log progress every 5 messages
+            if messages_received % 5 == 0:
+                elapsed = time.time() - start_time
+                current_hz = messages_received / elapsed
+                current_mbps = (total_bytes / elapsed) / (1024 * 1024)
+                avg_latency = sum(latencies[-5:]) / min(5, len(latencies))
+                print(f"Received {{messages_received}}: {{len(msg)/1024/1024:.1f}}MB, {{current_hz:.1f}} Hz, {{current_mbps:.1f}} MB/s, {{avg_latency:.1f}}ms")
+    except:
+        # Timeout expected
+        pass
+
+# Calculate final results
+duration = time.time() - start_time
+avg_latency = sum(latencies) / len(latencies) if latencies else 0
+actual_hz = messages_received / duration
+throughput_mbps = (total_bytes / duration) / (1024 * 1024)
+throughput_gbps = throughput_mbps / 1024
+
+result = {{
+    "type": "subscriber",
+    "messages_received": messages_received,
+    "total_bytes": total_bytes,
+    "total_mb": total_bytes / (1024 * 1024),
+    "duration": duration,
+    "actual_hz": actual_hz,
+    "target_hz": {target_hz},
+    "avg_latency_ms": avg_latency,
+    "throughput_mbps": throughput_mbps,
+    "throughput_gbps": throughput_gbps,
+    "efficiency": (actual_hz / {target_hz}) * 100,
+    "target_throughput_mbps": 1.4 * 1024,  # 1.4 GB/s target
+    "target_efficiency": (throughput_mbps / (1.4 * 1024)) * 100
+}}
+
+print(json.dumps(result))
+''']
+
+    subscriber_proc = subprocess.Popen(subscriber_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    # Give subscriber time to start
+    time.sleep(2)
 
     # Wait for both processes
     try:
