@@ -11,6 +11,19 @@ use event_loop::{PyEventLoop, add_event_loop_to_module};
 use pyo3::prelude::*;
 use nix::unistd::{fork, ForkResult, Pid};
 use nix::sys::wait::{waitpid, WaitStatus};
+use std::io::{self, Write};
+
+// Debug macro for stdout flushing (required for PyO3 debug output)
+macro_rules! debug_print {
+    ($($arg:tt)*) => {
+        {
+            print!("[PY_DEBUG] ");
+            print!($($arg)*);
+            print!("\n");
+            io::stdout().flush().unwrap();
+        }
+    };
+}
 
 // Publisher using Shared Memory Broadcast Buffer
 pub struct Publisher {
@@ -22,15 +35,22 @@ pub struct Publisher {
 impl Publisher {
     /// Create a new publisher with a shared memory broadcast buffer
     pub fn new(name: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        debug_print!("Publisher::new() called with name: {}", name);
+
         // Create shared memory broadcast buffer
         let buffer = SharedBroadcastBuffer::create(name)?;
-        let inner = BroadcastPublisher::new(buffer);
+        debug_print!("  SharedBroadcastBuffer created at {:p}", buffer);
 
-        Ok(Self {
+        let inner = BroadcastPublisher::new(buffer);
+        debug_print!("  BroadcastPublisher created");
+
+        let publisher = Self {
             inner,
             _buffer: buffer,
             _name: name.to_string(),
-        })
+        };
+        debug_print!("  Publisher::new() completed successfully");
+        Ok(publisher)
     }
 
     /// Broadcast a message to all subscribers synchronously
@@ -84,16 +104,23 @@ impl Subscriber {
 
     /// Create a new subscriber with a specific ID
     pub fn with_id(name: &str, subscriber_id: usize) -> Result<Self, Box<dyn std::error::Error>> {
+        debug_print!("Subscriber::with_id() called with name: {}, id: {}", name, subscriber_id);
+
         // Attach to existing shared memory broadcast buffer
         let buffer = SharedBroadcastBuffer::connect(name)?;
-        let inner = BroadcastSubscriber::new(buffer, subscriber_id);
+        debug_print!("  SharedBroadcastBuffer connected at {:p}", buffer);
 
-        Ok(Self {
+        let inner = BroadcastSubscriber::new(buffer, subscriber_id);
+        debug_print!("  BroadcastSubscriber created");
+
+        let subscriber = Self {
             inner,
             _buffer: buffer,
             _name: name.to_string(),
             _subscriber_id: subscriber_id,
-        })
+        };
+        debug_print!("  Subscriber::with_id() completed successfully");
+        Ok(subscriber)
     }
 
     /// Receive the next available broadcast message (blocking)
@@ -183,12 +210,17 @@ impl PyPublisher {
     }
 
     pub fn initialize(&mut self) -> PyResult<()> {
+        debug_print!("PyPublisher::initialize() called with name: {}", self.name);
         match Publisher::new(&self.name) {
             Ok(publisher) => {
                 self.inner = Some(publisher);
+                debug_print!("  PyPublisher::initialize() completed successfully");
                 Ok(())
             }
-            Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())),
+            Err(e) => {
+                debug_print!("  PyPublisher::initialize() failed: {}", e);
+                Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+            }
         }
     }
 
@@ -201,10 +233,21 @@ impl PyPublisher {
     }
 
     pub fn broadcast(&mut self, data: Vec<u8>) -> PyResult<u64> {
+        debug_print!("PyPublisher::broadcast() called with data size: {}", data.len());
         match &mut self.inner {
-            Some(publisher) => publisher.broadcast(&data)
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())),
-            None => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Publisher not initialized")),
+            Some(publisher) => {
+                let result = publisher.broadcast(&data)
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()));
+                match &result {
+                    Ok(seq) => debug_print!("  PyPublisher::broadcast() completed with sequence: {}", seq),
+                    Err(e) => debug_print!("  PyPublisher::broadcast() failed: {:?}", e),
+                }
+                result
+            }
+            None => {
+                debug_print!("  PyPublisher::broadcast() failed: Publisher not initialized");
+                Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Publisher not initialized"))
+            }
         }
     }
 
@@ -243,9 +286,33 @@ impl PyPublisher {
         }
     }
 
-    // Removed allocate_and_publish - not applicable for synchronous broadcast
-    // Removed allocate_pool_slot - not applicable for synchronous broadcast
-    // Removed publish_pool_slot - not applicable for synchronous broadcast
+    // Allocate a pool slot and return the slot index and pointer
+    pub fn allocate_pool_slot(&mut self) -> PyResult<(usize, usize)> {
+        match &mut self.inner {
+            Some(publisher) => {
+                // For broadcast, we return a direct pointer to the broadcast data area
+                let buffer = unsafe { &mut *publisher._buffer };
+                let slot = 0; // Broadcast has only one slot
+                let ptr = unsafe { buffer.broadcast_data.as_ptr() as usize };
+                Ok((slot, ptr))
+            }
+            None => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Publisher not initialized")),
+        }
+    }
+
+    // Publish a pool slot with given size
+    pub fn publish_pool_slot(&mut self, slot: usize, size: usize) -> PyResult<u64> {
+        match &mut self.inner {
+            Some(publisher) => {
+                // For broadcast, create a slice from the broadcast data and publish it
+                let buffer = unsafe { &mut *publisher._buffer };
+                let data = unsafe { std::slice::from_raw_parts(buffer.broadcast_data.as_ptr(), size) };
+                publisher.broadcast(data)
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+            }
+            None => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Publisher not initialized")),
+        }
+    }
 }
 
 #[pyclass(unsendable)]
@@ -275,12 +342,17 @@ impl PySubscriber {
     }
 
     pub fn initialize_with_id(&mut self, subscriber_id: usize) -> PyResult<()> {
+        debug_print!("PySubscriber::initialize_with_id() called with name: {}, id: {}", self.name, subscriber_id);
         match Subscriber::with_id(&self.name, subscriber_id) {
             Ok(subscriber) => {
                 self.inner = Some(subscriber);
+                debug_print!("  PySubscriber::initialize_with_id() completed successfully");
                 Ok(())
             }
-            Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())),
+            Err(e) => {
+                debug_print!("  PySubscriber::initialize_with_id() failed: {}", e);
+                Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+            }
         }
     }
 
@@ -304,11 +376,22 @@ impl PySubscriber {
         }
     }
 
-    pub fn receive(&mut self) -> PyResult<Vec<u8>> {
+    pub fn receive(&mut self, timeout: Option<f64>) -> PyResult<Vec<u8>> {
+        debug_print!("PySubscriber::receive() called with timeout: {:?}", timeout);
         match &mut self.inner {
-            Some(subscriber) => subscriber.receive()
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())),
-            None => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Subscriber not initialized")),
+            Some(subscriber) => {
+                let result = subscriber.receive()
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()));
+                match &result {
+                    Ok(data) => debug_print!("  PySubscriber::receive() completed with data size: {}", data.len()),
+                    Err(e) => debug_print!("  PySubscriber::receive() failed: {:?}", e),
+                }
+                result
+            }
+            None => {
+                debug_print!("  PySubscriber::receive() failed: Subscriber not initialized");
+                Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Subscriber not initialized"))
+            }
         }
     }
 
@@ -346,20 +429,25 @@ impl PySubscriber {
 // Utility functions for Python
 #[pyfunction]
 pub fn create_subscriber(name: String) -> PyResult<PySubscriber> {
+    debug_print!("create_subscriber() called with name: {}", name);
     PySubscriber::new(name)
 }
 
 #[pyfunction]
 pub fn create_subscriber_with_id(name: String, subscriber_id: usize) -> PyResult<PySubscriber> {
+    debug_print!("create_subscriber_with_id() called with name: {}, id: {}", name, subscriber_id);
     let mut subscriber = PySubscriber::new(name)?;
     subscriber.initialize_with_id(subscriber_id)?;
+    debug_print!("create_subscriber_with_id() completed successfully");
     Ok(subscriber)
 }
 
 #[pyfunction]
 pub fn create_publisher(name: String) -> PyResult<PyPublisher> {
+    debug_print!("create_publisher() called with name: {}", name);
     let mut publisher = PyPublisher::new(name)?;
     publisher.initialize()?;
+    debug_print!("create_publisher() completed successfully");
     Ok(publisher)
 }
 

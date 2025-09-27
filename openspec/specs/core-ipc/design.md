@@ -2,19 +2,7 @@
 
 ## Context
 
-The Core IPC system implements high-performance inter-process communication using Shared Memory Ring Buffer with atomic operations. This design document provides technical details on the architecture, patterns, and implementation decisions.
-
-## ⚠️ Important Warning: Do NOT Use io_uring
-
-**CRITICAL**: The io_uring-based approach has been deprecated and abandoned due to fundamental architectural issues. All implementations MUST use the Shared Memory Ring Buffer approach described in this specification.
-
-**Why io_uring Failed**:
-- io_uring operations submitted successfully but generated zero completions
-- Complex ring sharing between processes proved unreliable
-- Kernel completion ring mechanism unsuitable for message passing
-- Unpredictable behavior under high-frequency messaging scenarios
-
-**Current Implementation**: Shared Memory Ring Buffer with atomic operations only
+The Core IPC system implements high-performance inter-process communication using Shared Memory Broadcast Buffer with process-shared mutex synchronization. This design document provides technical details on the architecture, patterns, and implementation decisions for the synchronous broadcast system.
 
 ## Architecture Overview
 
@@ -28,13 +16,14 @@ The Core IPC system implements high-performance inter-process communication usin
 │  ┌───────────┐  │    │  ┌───────────┐  │    │  ┌───────────┐  │
 │  │   Shared │  │    │  │   Shared │  │    │  │   Shared │  │
 │  │  Memory  │  │    │  │  Memory  │  │    │  │  Memory  │  │
-│  │   Pool   │  │    │  │   Pool   │  │    │  │   Pool   │  │
+│  │ Broadcast│  │    │  │ Broadcast│  │    │  │ Broadcast│  │
+│  │  Buffer  │  │    │  │  Buffer  │  │    │  │  Buffer  │  │
 │  └───────────┘  │    │  └───────────┘  │    │  └───────────┘  │
 │        │        │    │        │        │    │        │        │
 │  ┌───────────┐  │    │  ┌───────────┐  │    │  ┌───────────┐  │
-│  │Ring Buffer│  │    │  │Ring Buffer│  │    │  │Ring Buffer│  │
-│  │   with   │  │    │  │   with   │  │    │  │   with   │  │
-│  │ Atomics  │  │    │  │ Atomics  │  │    │  │ Atomics  │  │
+│  │Process-   │  │    │  │Process-   │  │    │  │Process-   │  │
+│  │Shared     │  │    │  │Shared     │  │    │  │Shared     │  │
+│  │Mutex      │  │    │  │Mutex      │  │    │  │Mutex      │  │
 │  └───────────┘  │    │  └───────────┘  │    │  └───────────┘  │
 │        │        │    │        │        │    │        │        │
 │        └────────┼────┼────────┼────────┼────┼────────┘        │
@@ -44,7 +33,7 @@ The Core IPC system implements high-performance inter-process communication usin
                         └────────┼────────┘
                                  │
                     ┌─────────────────┐
-                    │   Shared        │
+                    │   POSIX Shared  │
                     │   /dev/shm/     │
                     │   Memory Region │
                     └─────────────────┘
@@ -52,127 +41,158 @@ The Core IPC system implements high-performance inter-process communication usin
 
 ### Key Data Structures
 
-#### SharedRingBuffer
+#### SharedBroadcastBuffer
 ```rust
-pub struct SharedRingBuffer {
-    fd: i32,                    // File descriptor for shared memory
-    ptr: *mut u8,              // Pointer to mapped memory
-    size: usize,                // Total buffer size
-    head: AtomicU64,           // Atomic head pointer for publisher
-    tails: [AtomicU64; 16],     // Atomic tail pointers for subscribers
-    offsets: [u32; MAX_MESSAGES], // Message offsets in buffer
-    lengths: [u32; MAX_MESSAGES], // Message lengths
-    available: [AtomicU64; 16], // Bitmap tracking message availability
-    pool: [[u8; POOL_SLOT_SIZE]; POOL_SIZE],  // Pre-allocated 35MB slots
-    pool_available: AtomicU64,                // Bitmap tracking pool slots
-    pool_sequence: [AtomicU64; POOL_SIZE],    // Sequence numbers for slots
+#[repr(C, align(64))]
+pub struct SharedBroadcastBuffer {
+    // Process-shared synchronization (cache-aligned)
+    mutex: ProcessSharedMutex,
+
+    // Synchronous broadcast state (packed for cache efficiency)
+    subscriber_count: u32,        // Number of registered subscribers (0-32)
+    broadcast_state: u32,         // Current broadcast state
+    sequence_number: u64,         // Monotonically increasing sequence number
+    broadcast_length: u32,        // Length of data in broadcast slot
+    max_subscriber_id: u32,       // Highest subscriber ID for optimization
+
+    // Dynamic subscriber tracking arrays
+    subscriber_ack_array: [u32; MAX_DYNAMIC_SUBSCRIBERS],  // Acknowledgment status per subscriber
+    subscriber_reg_array: [u32; MAX_DYNAMIC_SUBSCRIBERS],  // Registration status per subscriber
+
+    // Single broadcast slot accessible to all subscribers
+    broadcast_data: [u8; BROADCAST_SLOT_SIZE],  // 35MB single broadcast slot
 }
 ```
 
-#### PoolSlot
+#### ProcessSharedMutex
 ```rust
-pub struct PoolSlot {
-    slot_index: usize,          // Index in the pre-allocated pool
-    size: usize,                // Actual data size
-    sequence: u64,              // Sequence number for tracking
-    is_valid: bool,             // Slot validity flag
+#[repr(C, align(64))]
+pub struct ProcessSharedMutex {
+    mutex: pthread_mutex_t,
 }
 
-impl PoolSlot {
-    pub fn new(slot_index: usize, size: usize, sequence: u64) -> Self
-    pub fn slot_index(&self) -> usize
-    pub fn size(&self) -> usize
-    pub fn sequence(&self) -> u64
-    pub fn is_valid(&self) -> bool
+impl ProcessSharedMutex {
+    pub fn init(&mut self)  // Initialize for cross-process sharing
+    pub fn lock(&self)      // Lock with atomic operations
+    pub fn unlock(&self)    // Unlock with atomic operations
+    pub fn destroy(&mut self) // Clean up resources
 }
 ```
 
-#### RingBuffer
+#### BroadcastPublisher
 ```rust
-pub struct RingBuffer {
-    fd: i32,                    // Shared memory file descriptor
-    ptr: *mut u8,              // Pointer to mapped memory
-    size: usize,                // Total buffer size
-    max_messages: usize,        // Maximum number of messages
-    max_subscribers: usize,    // Maximum number of subscribers
+pub struct BroadcastPublisher {
+    buffer: *mut SharedBroadcastBuffer,
+}
+
+impl BroadcastPublisher {
+    pub fn new(buffer: *mut SharedBroadcastBuffer) -> Self
+    pub fn broadcast(&mut self, data: &[u8]) -> Result<u64, Error>
+    pub fn register_subscriber(&mut self) -> usize
+    pub fn subscriber_count(&self) -> usize
+    pub fn wait_for_subscribers(&self, expected_count: u32) -> Result<(), Error>
+}
+```
+
+#### BroadcastSubscriber
+```rust
+pub struct BroadcastSubscriber {
+    buffer: *mut SharedBroadcastBuffer,
+    subscriber_id: usize,
+    last_sequence: u64,
+}
+
+impl BroadcastSubscriber {
+    pub fn new(buffer: *mut SharedBroadcastBuffer, subscriber_id: usize) -> Self
+    pub fn register(&self) -> Result<(), Error>
+    pub fn receive(&mut self) -> Result<Vec<u8>, Error>
+    pub fn has_new_message(&self) -> bool
+    pub fn last_processed(&self) -> u64
 }
 ```
 
 ## Implementation Patterns
 
-### Pre-allocated Memory Pool Management
+### Process-Shared Mutex Implementation
 
-#### Pool Constants
-- **Slot Size**: 35MB (matching performance requirements)
-- **Pool Size**: 63 slots (maximum for u64 bitmap)
-- **Bitmap Format**: 1 bit per slot (0 = free, 1 = allocated)
-- **Allocation Strategy**: First available slot with atomic operations
-- **Sequence Tracking**: Atomic sequence numbers per slot
+#### Constants and Configuration
+- **Mutex Type**: pthread_mutex_t with PTHREAD_PROCESS_SHARED attribute
+- **Alignment**: 64-byte cache-line alignment to prevent false sharing
+- **Performance**: 10-30 nanoseconds for uncontended lock/unlock
+- **Memory Ordering**: Sequential consistency for cross-process visibility
 
 #### Memory Layout
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                 Shared Memory Pool                          │
+│                Shared Broadcast Buffer                      │
 ├─────────────────────────────────────────────────────────────┤
-│ Ring Buffer Structure                                        │
-│ - head/tail pointers                                        │
-│ - message metadata                                          │
-│ - availability bitmap                                      │
+│ Process-Shared Mutex (64 bytes, cache-aligned)              │
 ├─────────────────────────────────────────────────────────────┤
-│ Pre-allocated Pool Slots (35MB each)                       │
-│ [Slot 0][Slot 1][Slot 2]...[Slot 62]                      │
+│ Broadcast State (20 bytes)                                  │
+│ - subscriber_count: u32                                     │
+│ - broadcast_state: u32                                      │
+│ - sequence_number: u64                                      │
+│ - broadcast_length: u32                                     │
+│ - max_subscriber_id: u32                                    │
+├─────────────────────────────────────────────────────────────┤
+│ Subscriber Tracking Arrays (256 bytes)                      │
+│ - subscriber_ack_array[32]: u32                             │
+│ - subscriber_reg_array[32]: u32                             │
+├─────────────────────────────────────────────────────────────┤
+│ Broadcast Data Slot (35MB)                                  │
+│ - Direct memory access for all processes                    │
+│ - Zero-copy transmission                                    │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-#### Pool Slot Allocation Process
-1. Atomically check pool availability bitmap
-2. Find first available slot using bit operations
-3. Atomically claim slot and assign sequence number
-4. Return slot pointer and index to caller
+#### Mutex Operations
+- **Initialization**: Set PTHREAD_PROCESS_SHARED attribute for cross-process sharing
+- **Locking**: Atomic operation with system call fallback for contention
+- **Unlocking**: Atomic operation with memory barrier
+- **Cleanup**: Proper destruction on shared memory cleanup
 
-#### Pool Slot Release Process
-1. Validate slot index and sequence number
-2. Mark slot as available in bitmap
-3. Update sequence tracking
-4. Return slot to pool
+### Synchronous Broadcast Coordination
 
-### Atomic Operation Integration
+#### Broadcast States
+- **STATE_PUBLISHING (0)**: Publisher is writing data to broadcast slot
+- **STATE_WAITING (1)**: Publisher waiting for subscriber acknowledgments
+- **STATE_COMPLETED (2)**: All subscribers acknowledged, ready for next broadcast
 
-#### Head Pointer Updates
-- **Operation**: Atomic compare-and-swap for head advancement
-- **Memory Ordering**: Sequential consistency for cross-process visibility
-- **Overflow Handling**: Wrap-around with sequence number tracking
+#### Broadcast Flow
+1. **State Check**: Publisher ensures previous broadcast is completed
+2. **Data Copy**: Publisher writes data directly to shared broadcast slot
+3. **State Update**: Publisher sets state to PUBLISHING, then WAITING
+4. **Acknowledgment Wait**: Publisher waits for all subscribers to acknowledge
+5. **Completion**: Publisher sets state to COMPLETED after all acknowledgments
+6. **Reset**: Publisher resets acknowledgment bits for next broadcast
 
-#### Tail Pointer Updates
-- **Operation**: Atomic loads and stores per subscriber
-- **Memory Ordering**: Acquire-release semantics
-- **Independent Tracking**: Each subscriber maintains separate tail pointer
-
-#### Bitmap Operations
-- **Availability Updates**: Atomic bitwise operations
-- **Subscriber Tracking**: 16 separate bitmap words for 16 subscribers
-- **Message Indexing**: 1024 message slots (16 × 64 bits)
+#### Subscriber Flow
+1. **Registration**: Subscriber registers and receives unique ID (0-31)
+2. **Message Wait**: Subscriber waits for state to be WAITING with new sequence
+3. **Data Read**: Subscriber reads directly from broadcast slot
+4. **Acknowledgment**: Subscriber sets acknowledgment bit atomically
+5. **Sequence Update**: Subscriber updates last processed sequence
 
 ### Multi-Process Architecture
 
 #### Process Creation Flow
-1. **Parent**: Create shared memory region with unique identifier
-2. **Parent**: Initialize ring buffer with atomic head/tail pointers
-3. **Parent**: Fork child process using `fork()`
-4. **Child**: Attach to parent's shared memory using identifier
-5. **Child**: Initialize subscriber with independent tail pointer
-6. **Child**: Begin receiving messages from shared ring buffer
+1. **Parent**: Creates shared memory region with unique identifier
+2. **Parent**: Initializes broadcast buffer with process-shared mutex
+3. **Parent**: Forks child processes using `fork()`
+4. **Child**: Attaches to parent's shared memory using identifier
+5. **Child**: Creates subscriber with unique ID and registers
+6. **Child**: Begins receiving synchronous broadcasts
 
 #### Shared Memory Naming
-- **Pattern**: `/dev/shm/ultrapubsub_[identifier]`
-- **Uniqueness**: Include process ID and timestamp
-- **Cleanup**: Automatic unlink on last process exit
+- **Pattern**: `/ultrapubsub_[identifier]` (POSIX shared memory)
+- **Uniqueness**: Include process ID and timestamp for uniqueness
+- **Cleanup**: Automatic unlink on last process exit or explicit cleanup
 
-#### Shared Memory Attachment
+#### Shared Memory Operations
 ```rust
 // Parent creates shared memory
-let shm_name = format!("/dev/shm/ultrapubsub_{}_{}", pid, timestamp);
-let fd = shm_open(&shm_name, O_CREAT | O_RDWR, 0666);
+let shm_name = format!("/ultrapubsub_{}", unique_id);
+let fd = shm_open(&shm_name, O_CREAT | O_RDWR | O_EXCL, 0666);
 ftruncate(fd, buffer_size);
 let ptr = mmap(nullptr, buffer_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 
@@ -181,129 +201,121 @@ let fd = shm_open(&shm_name, O_RDWR, 0666);
 let ptr = mmap(nullptr, buffer_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 ```
 
-### Large Binary Blob Handling
+### Large Binary Data Handling
 
-#### Signature System
-```rust
-// Header signature: "ULTRAPUBSUB_BLOB_START_[SIZE]MB"
-// Footer signature: "ULTRAPUBSUB_BLOB_END_[SIZE]MB"
+#### Single Slot Architecture
+- **Slot Size**: 35MB contiguous memory block
+- **Access**: Direct memory access for all processes
+- **Synchronization**: Mutex-protected coordinated access
+- **Performance**: Zero-copy transmission between processes
 
-struct BlobSignature {
-    header: Vec<u8>,
-    footer: Vec<u8>,
-    size_mb: usize,
-}
-```
+#### Data Transmission Process
+1. **Publisher**: Writes data directly to 35MB broadcast slot
+2. **Subscribers**: All subscribers read from identical memory location
+3. **Acknowledgment**: Each subscriber acknowledges independently
+4. **Completion**: Publisher waits for all acknowledgments before continuing
 
-#### Blob Generation Process
-1. Create header signature with size information
-2. Generate deterministic payload data
-3. Append footer signature
-4. Calculate checksum for verification
-5. Return complete blob with signatures
-
-#### Verification Process
-1. Check header signature matches expected size
-2. Check footer signature matches expected size
-3. Verify payload size is correct
-4. Calculate and verify checksum
-5. Return validation result
+#### Memory Safety
+- **Bounds Checking**: All accesses validated against 35MB limit
+- **Synchronization**: Mutex prevents concurrent write access
+- **Atomic Operations**: Acknowledgment bits updated atomically
+- **Cleanup**: Proper shared memory cleanup on termination
 
 ### Error Handling Strategy
 
 #### Memory Allocation Errors
-- **Out of Memory**: Return `Error::OutOfMemory`
-- **Invalid Size**: Return `Error::InvalidSize`
-- **Fragmentation**: Return `Error::Fragmentation`
+- **Shared Memory Creation**: Return `Error::SharedMemoryCreationFailed`
+- **Memory Mapping**: Return `Error::MemoryMappingFailed`
+- **Size Validation**: Return `Error::InvalidSize` for oversized messages
 
 #### Process Communication Errors
 - **Attachment Failure**: Return `Error::AttachFailed`
-- **Memory Sharing**: Return `Error::MemorySharingFailed`
-- **Process Exit**: Handle cleanup automatically
+- **Mutex Errors**: Return `Error::MutexOperationFailed`
+- **Process Exit**: Handle cleanup automatically in Drop implementations
 
-#### Data Integrity Errors
-- **Signature Mismatch**: Return `Error::SignatureMismatch`
-- **Checksum Failure**: Return `Error::ChecksumFailed`
-- **Corruption Detected**: Return `Error::DataCorruption`
+#### Synchronization Errors
+- **Timeout**: Return `Error::Timeout` for unresponsive subscribers
+- **Invalid State**: Return `Error::InvalidState` for state inconsistencies
+- **Registration Errors**: Return `Error::RegistrationFailed` for duplicate IDs
 
 ## Performance Optimizations
 
-### Memory Pool Optimizations
-- **Bitmap Operations**: Use bit manipulation for efficiency
-- **Contiguous Allocation**: Minimize memory fragmentation
-- **Zero-Copy**: Avoid data copying between processes
+### Cache-Line Optimization
+- **64-byte Alignment**: All shared structures aligned to cache line size
+- **False Sharing Prevention**: Separate arrays for different data types
+- **Spatial Locality**: Related data grouped together
+- **Memory Ordering**: Appropriate memory ordering for atomic operations
 
-### Zero-Copy Pool Management
+### Zero-Copy Architecture
+- **Direct Memory Access**: Publisher and subscribers access same memory
+- **No Data Copying**: Eliminates memory bandwidth overhead
+- **Contiguous Memory**: Single 35MB block for efficient access
+- **Memory Mapping**: Shared memory mapped into each process space
 
-#### Pool Slot Access
-- **Direct Memory Access**: No copying between publisher and subscribers
-- **Atomic Operations**: Lock-free slot allocation and release
-- **Memory Safety**: Bounds checking and sequence number validation
-
-#### Pool Slot Usage
-1. Publisher allocates slot from pre-allocated pool
-2. Publisher writes data directly to slot memory
-3. Publisher publishes slot index with sequence number
-4. Subscribers read data directly from shared slot memory
-5. Publisher releases slot back to pool after all subscribers
-
-### Multi-Process Optimizations
-- **Shared Memory**: Direct memory access between processes
-- **Efficient Signaling**: Use io_uring for process coordination
-- **Resource Cleanup**: Automatic cleanup on process exit
+### Efficient Acknowledgment System
+- **Bitmap Tracking**: Bit arrays for acknowledgment status
+- **Atomic Operations**: Fast acknowledgment updates
+- **Batched Checking**: Efficient checking of all acknowledgments
+- **Adaptive Waiting**: Spin-wait for short periods, yield for longer
 
 ## Security Considerations
 
 ### Memory Safety
-- **Bounds Checking**: All array accesses are bounds-checked
-- **Null Termination**: Proper handling of C-style strings
-- **Reference Validation**: PoolSlot validation before use
+- **Bounds Checking**: All array accesses validated
+- **Null Pointer Protection**: All pointers validated before use
+- **Memory Mapping**: Proper mapping and unmapping
+- **Synchronization**: All shared access properly synchronized
 
 ### Process Isolation
-- **Shared Memory Security**: Secure memory mapping with proper permissions
-- **Memory Permissions**: Appropriate read/write permissions
-- **Resource Limits**: Prevent resource exhaustion attacks
+- **Shared Memory Security**: Proper permissions on shared memory
+- **Independent Attachment**: Each process attaches independently
+- **Resource Limits**: Prevent resource exhaustion
+- **Cleanup**: Proper cleanup on process termination
 
 ### Data Integrity
-- **Signature Verification**: Cryptographic-style verification
-- **Checksum Validation**: Additional integrity checks
-- **Corruption Detection**: Detect and handle data corruption
+- **Synchronous Delivery**: All subscribers receive identical data
+- **Acknowledgment Verification**: Publisher verifies all acknowledgments
+- **Sequence Tracking**: Monotonically increasing sequence numbers
+- **State Validation**: All state transitions validated
 
 ## Testing Strategy
 
 ### Unit Tests
-- **Memory Pool**: Test allocation, deallocation, error cases
-- **PoolSlot**: Test creation, validation, operations
-- **Bitmap**: Test bit manipulation, bounds checking
-- **Shared Memory**: Test creation, attachment, cleanup
-- **Atomic Operations**: Test head/tail pointer operations
+- **Mutex Operations**: Test process-shared mutex functionality
+- **Broadcast Buffer**: Test buffer creation, attachment, cleanup
+- **Publisher**: Test broadcast operations and acknowledgment waiting
+- **Subscriber**: Test registration, message reception, acknowledgment
+- **State Management**: Test state transitions and validation
 
 ### Integration Tests
-- **Multi-Process**: Test fork/exec, shared memory attachment
-- **Large Data**: Test 35MB blob generation, verification
-- **Performance**: Test 40Hz frequency, at least GB/s throughput metrics
-- **Error Handling**: Test error conditions, recovery
-- **Zero-Copy**: Test pre-allocated pool operations
+- **Multi-Process**: Test fork/exec with shared memory attachment
+- **Large Data**: Test 35MB message transmission
+- **Performance**: Verify 40Hz frequency and throughput targets
+- **Error Handling**: Test timeout and error recovery scenarios
+- **Python Integration**: Test PyO3 bindings and Python APIs
 
 ### Stress Tests
 - **High Frequency**: Test sustained 40Hz messaging with 35MB payloads
-- **Memory Pressure**: Test 6 subscribers × 35MB = 210MB memory footprint
-- **Concurrent Access**: Test 6 independent subscriber processes
-- **Long Duration**: Test stability over extended 40Hz operation
+- **Maximum Subscribers**: Test with 32 concurrent subscribers
+- **Memory Pressure**: Test behavior under continuous load
+- **Timing Accuracy**: Test 25ms cycle time precision
+- **Long Duration**: Test stability over extended operation
 
 ## Future Enhancements
 
 ### Performance Improvements
-- **Adaptive Pool Sizes**: Dynamic slot size allocation
-- **Memory Compression**: Optional compression for large data
-- **Batch Processing**: More efficient slot allocation operations
+- **Adaptive Timing**: Dynamic timeout adjustment based on load
+- **Memory Prefetching**: Optimize memory access patterns
+- **Batched Operations**: Group multiple operations for efficiency
+- **NUMA Awareness**: Optimize for NUMA architectures
 
 ### Feature Enhancements
-- **Message Filtering**: Subscriber-side message filtering
-- **Priority Queuing**: Priority-based message handling
-- **Statistics**: Performance metrics and monitoring
+- **Message Filtering**: Optional subscriber-side filtering
+- **Priority Messaging**: Priority-based message handling
+- **Statistics**: Performance metrics collection
+- **Dynamic Scaling**: Adaptive subscriber limits
 
 ### Platform Support
-- **Alternative Atomic Implementations**: Support for different CPU architectures
-- **Cross-Platform**: Windows/macOS support (if needed)
-- **Hardware Acceleration**: GPU-assisted memory operations
+- **Alternative Mutex**: Support different synchronization primitives
+- **Cross-Platform**: Windows/macOS support if needed
+- **Hardware Acceleration**: CPU-specific optimizations

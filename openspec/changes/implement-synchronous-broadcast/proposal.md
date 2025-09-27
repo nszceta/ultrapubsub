@@ -13,7 +13,7 @@ The current implementation assumes a traditional pub/sub model where subscribers
 
 ## Impact
 - **Affected specs**: core-ipc
-- **Affected code**: src/ring_buffer.rs, src/lib.rs, python/ultrapubsub/api.py, test scripts
+- **Affected code**: src/broadcast_buffer.rs, src/lib.rs, python/ultrapubsub/api.py, test scripts
 - **Performance impact**: May reduce maximum throughput due to synchronization requirements
 - **Breaking changes**: Yes - fundamental architecture change from async to sync
 - **Migration requirements**: Complete redesign of message handling logic

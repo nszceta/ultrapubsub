@@ -454,3 +454,5 @@ openspec archive [change]  # Mark complete
 Remember: Specs are truth. Changes are proposals. Keep them in sync.
 
 <!-- OPENSPEC:END -->
+
+@TOOLS.md
