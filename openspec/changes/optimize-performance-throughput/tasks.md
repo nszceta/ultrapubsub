@@ -18,14 +18,13 @@
 - [x] Align subscriber arrays to cache lines (64-byte boundaries)
 - [x] Implement efficient bit manipulation for acknowledgment tracking
 - [ ] Use relaxed memory ordering where appropriate
-- [ ] Implement batch acknowledgment processing
-- [ ] Add atomic operation batching for reduced contention
+- [ ] Optimize individual acknowledgment atomic operations
+- [ ] Add atomic operation optimization for reduced contention
 
 ### 4. Acknowledgment Mechanism Refinement
-- [ ] Implement batched acknowledgment processing
-- [ ] Add acknowledgment coalescing to reduce atomic operations
+- [ ] Optimize individual acknowledgment processing for minimum latency
 - [ ] Implement adaptive timeout based on historical performance
-- [ ] Add acknowledgment state machine for better error handling
+- [ ] Add efficient acknowledgment synchronization with futex
 - [x] Optimize acknowledgment array layout for spatial locality
 
 ### 5. Timing and Synchronization Improvements
@@ -43,14 +42,14 @@
 - [ ] Add alerting for performance degradation
 
 ### 7. Concurrency and Parallelism Improvements
-- [ ] Implement lock-free data structures where possible
+- [ ] Implement futex-based synchronization for cross-process coordination
 - [ ] Add reader-writer locks for read-heavy operations
-- [ ] Implement work-stealing for load balancing
+- [ ] Implement spin-wait optimization for critical sections
 - [ ] Add CPU affinity for critical threads
-- [ ] Implement POSIX-specific optimizations (futex, eventfd)
+- [ ] Implement futex wait/wake optimization
 
 ### 8. Platform-Specific Optimizations
-- [ ] Implement Linux-specific optimizations (futex, eventfd)
+- [ ] Implement Linux futex optimization for maximum performance
 - [ ] Add support for huge pages for large memory allocations
 - [ ] Implement CPU instruction set optimizations (AVX2, SIMD)
 - [ ] Add support for non-uniform memory access (NUMA) optimization
@@ -81,8 +80,7 @@
 
 ### Pending Optimizations:
 - 🔄 Adaptive wait strategy (spin-wait → yield → sleep)
-- 🔄 Batched acknowledgment processing
-- 📍 Linux-specific POSIX optimizations (futex, eventfd)
+- 📍 Linux futex synchronization for maximum performance
 - 📍 Performance monitoring and metrics collection
 - 📍 Memory prefetching and cache optimization
 
@@ -92,8 +90,8 @@
 - Test files: Basic functionality validated
 
 ### Key Features To Implement:
-- **Linux futex integration** for efficient waiting
-- **Eventfd-based signaling** for process coordination
+- **Linux futex integration** for efficient cross-process synchronization
+- **Individual acknowledgment optimization** for minimum latency
 - **Adaptive timeout mechanisms**
 - **Real-time performance monitoring**
 - **Advanced atomic operations**

@@ -13,3 +13,12 @@ Always set timeouts for tests. Tests can unexpectedly hang and hanging is UNACCE
 Tests should always complete within 60 seconds, preferably 10.
 
 Do not remove debug print statements.
+
+
+**Tools and Commands:**
+- Build: `maturin develop`
+- Spec management: `openspec list`, `openspec validate`, `openspec show`
+
+Use uv extensively when dealing with Python code. Use `uv add` to add packages to the local virtual environment and launch python scripts with `uv run`
+
+NEVER modify sys.path without my explicit permission.
