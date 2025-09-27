@@ -251,9 +251,6 @@ impl PyPublisher {
         }
     }
 
-    // Removed try_publish - not applicable for synchronous broadcast
-    // Removed publish_batch - broadcast sends single message to all subscribers
-
     pub fn subscriber_count(&self) -> PyResult<usize> {
         match &self.inner {
             Some(publisher) => Ok(publisher.subscriber_count()),
@@ -286,33 +283,8 @@ impl PyPublisher {
         }
     }
 
-    // Allocate a pool slot and return the slot index and pointer
-    pub fn allocate_pool_slot(&mut self) -> PyResult<(usize, usize)> {
-        match &mut self.inner {
-            Some(publisher) => {
-                // For broadcast, we return a direct pointer to the broadcast data area
-                let buffer = unsafe { &mut *publisher._buffer };
-                let slot = 0; // Broadcast has only one slot
-                let ptr = unsafe { buffer.broadcast_data.as_ptr() as usize };
-                Ok((slot, ptr))
-            }
-            None => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Publisher not initialized")),
-        }
-    }
-
-    // Publish a pool slot with given size
-    pub fn publish_pool_slot(&mut self, slot: usize, size: usize) -> PyResult<u64> {
-        match &mut self.inner {
-            Some(publisher) => {
-                // For broadcast, create a slice from the broadcast data and publish it
-                let buffer = unsafe { &mut *publisher._buffer };
-                let data = unsafe { std::slice::from_raw_parts(buffer.broadcast_data.as_ptr(), size) };
-                publisher.broadcast(data)
-                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
-            }
-            None => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Publisher not initialized")),
-        }
-    }
+    // Removed pool slot methods - broadcast uses single 35MB slot instead of pool
+    // Use broadcast() method for publishing data directly
 }
 
 #[pyclass(unsendable)]

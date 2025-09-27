@@ -1,7 +1,7 @@
 ## Implementation Tasks
 
 ### 1. Core Architecture Changes
-- [x] Modify ring buffer for single broadcast message instead of individual messages
+- [x] Modify broadcast buffer for single broadcast message instead of individual messages
 - [x] Implement publisher wait mechanism for all subscribers
 - [x] Add subscriber acknowledgment system
 - [x] Update atomic operations for synchronous coordination

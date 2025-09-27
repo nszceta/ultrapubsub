@@ -1,7 +1,7 @@
 """
 High-level Python API for ultrapubsub
 
-Current Implementation: Shared Memory Ring Buffer with atomic operations only
+Current Implementation: Shared Memory Broadcast Buffer with atomic operations only
 """
 
 import os
@@ -13,7 +13,7 @@ from .ultrapubsub import PyPublisher, PySubscriber
 
 class SharedMemory:
     """
-    High-level wrapper for shared memory management using Ring Buffer.
+    High-level wrapper for shared memory management using Broadcast Buffer.
 
     This class provides a simplified interface for creating and managing
     shared memory regions for inter-process communication.
@@ -137,6 +137,9 @@ class Publisher:
         """
         Try to publish data to shared memory without blocking.
 
+        Note: This method is deprecated for synchronous broadcast where all subscribers
+        receive the same message. Use broadcast() instead.
+
         Args:
             data: Bytes data to publish
 
@@ -230,6 +233,9 @@ class Publisher:
         """
         Allocate shared memory and return pointer for direct writing.
 
+        Note: This method is deprecated for broadcast buffer architecture.
+        Use broadcast() for simpler message publishing.
+
         Args:
             size: Size of memory to allocate in bytes
 
@@ -245,6 +251,9 @@ class Publisher:
         """
         Publish pre-allocated shared memory.
 
+        Note: This method is deprecated for broadcast buffer architecture.
+        Use broadcast() for simpler message publishing.
+
         Args:
             ptr: Memory address from allocate_and_write
             size: Size of the allocated memory
@@ -257,6 +266,9 @@ class Publisher:
     def free_memory(self, ptr: int, size: int) -> None:
         """
         Free previously allocated memory.
+
+        Note: This method is deprecated for broadcast buffer architecture.
+        Use broadcast() for simpler message publishing.
 
         Args:
             ptr: Memory address to free
@@ -280,9 +292,9 @@ class Publisher:
         """
         Allocate a slot from the pre-allocated memory pool.
 
-        This method provides zero-copy access to a pre-allocated 35MB slot
-        in shared memory. The caller can write directly to this memory
-        and then publish it with publish_pool_slot.
+        Note: This method is deprecated for broadcast buffer architecture.
+        The broadcast buffer uses a single 35MB slot instead of a pool.
+        Use broadcast() for simpler message publishing.
 
         Returns:
             Tuple of (slot_id, memory_address) for direct writing
@@ -296,8 +308,9 @@ class Publisher:
         """
         Publish a pre-allocated pool slot.
 
-        After writing data to the pool slot obtained from allocate_pool_slot,
-        call this method to make the data available to subscribers.
+        Note: This method is deprecated for broadcast buffer architecture.
+        The broadcast buffer uses a single 35MB slot instead of a pool.
+        Use broadcast() for simpler message publishing.
 
         Args:
             slot: Slot ID from allocate_pool_slot

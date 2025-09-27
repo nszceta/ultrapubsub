@@ -49,7 +49,7 @@ The system SHALL provide synchronization mechanisms for coordinating broadcast c
 - **THEN** the system SHALL track which subscribers have completed processing
 - **AND** the system SHALL use atomic operations for completion flags
 - **AND** the publisher SHALL monitor all completion flags
-- **AND** the system SHALL support exactly 6 concurrent subscribers
+- **AND** the system SHALL support exactly 32 concurrent subscribers
 
 #### Scenario: Broadcast Cycle Management
 - **WHEN** all subscribers complete processing
@@ -84,7 +84,7 @@ The system SHALL provide comprehensive subscriber registration and deregistratio
 - **THEN** the system SHALL maintain atomic subscriber count
 - **AND** the system SHALL track which subscriber IDs are active
 - **AND** the system SHALL prevent duplicate registrations
-- **AND** the system SHALL validate subscriber ID ranges (0-5)
+- **AND** the system SHALL validate subscriber ID ranges (0-31)
 - **AND** the system SHALL provide subscriber status information
 
 ### Requirement: Broadcast State Management
@@ -99,10 +99,10 @@ The system SHALL manage broadcast state to coordinate publisher and subscriber a
 
 #### Scenario: Subscriber Registration Validation
 - **WHEN** subscribers attach to the broadcast
-- **THEN** the system SHALL ensure exactly 6 subscribers are registered
-- **AND** the system SHALL validate subscriber IDs 0-5
-- **AND** the system SHALL reject additional subscribers beyond 6
-- **AND** the system SHALL not start broadcasting until all 6 are ready
+- **THEN** the system SHALL ensure exactly 32 subscribers are registered
+- **AND** the system SHALL validate subscriber IDs 0-31
+- **AND** the system SHALL reject additional subscribers beyond 32
+- **AND** the system SHALL not start broadcasting until all 32 are ready
 
 ### Requirement: Fault Tolerance and Recovery
 The system SHALL handle faults in the synchronous broadcast environment.
