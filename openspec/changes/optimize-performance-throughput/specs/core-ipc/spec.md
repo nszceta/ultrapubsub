@@ -49,6 +49,18 @@ Performance benchmarks MUST launch the publisher as a standalone spawned process
 - **AND** no processes shall be created through fork inheritance
 - **AND** all processes shall have proper cleanup and resource management
 
+### Requirement: Mandatory Benchmark Timeouts
+Performance benchmarks SHALL implement reasonable timeouts to prevent system resource exhaustion and ensure tests complete within acceptable timeframes.
+
+#### Scenario: Timeout Enforcement
+- **WHEN** running performance benchmarks
+- **THEN** publisher startup SHALL timeout within 30 seconds if no subscribers register
+- **AND** subscriber processes SHALL timeout within 60 seconds of test start
+- **AND** message receive operations SHALL timeout within 1 second
+- **AND** overall test duration SHALL NOT exceed 120 seconds
+- **AND** process cleanup SHALL timeout within 10 seconds
+- **AND** orchestrator SHALL terminate all processes if total test time exceeds 150 seconds
+
 #### Scenario: Reduced Acknowledgment Overhead
 - **WHEN** a publisher broadcasts a message
 - **THEN** the acknowledgment mechanism shall minimize atomic operations
