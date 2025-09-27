@@ -11,19 +11,19 @@ use std::sync::Mutex;
 // Thread-safe coordinator storage
 static COORDINATOR: Mutex<Option<SyncCoordinator>> = Mutex::new(None);
 
-/// Create a synchronization coordinator for broadcasting
+/// Create a synchronization coordinator for broadcasting (publisher)
 #[pyfunction]
 fn create_coordinator(name: &str) -> PyResult<()> {
     let mut coord = COORDINATOR.lock().unwrap();
-    *coord = Some(SyncCoordinator::create(name).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?);
+    *coord = Some(SyncCoordinator::create_publisher(name).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?);
     Ok(())
 }
 
-/// Connect to existing synchronization coordinator
+/// Connect to existing synchronization coordinator (subscriber)
 #[pyfunction]
 fn connect_coordinator(name: &str) -> PyResult<()> {
     let mut coord = COORDINATOR.lock().unwrap();
-    *coord = Some(SyncCoordinator::connect(name).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?);
+    *coord = Some(SyncCoordinator::connect_subscriber(name).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?);
     Ok(())
 }
 
@@ -72,13 +72,11 @@ fn wait_for_broadcast(timeout_ms: u32) -> PyResult<Option<u32>> {
 
 /// Acknowledge broadcast receipt (subscriber side)
 #[pyfunction]
-fn acknowledge_broadcast() -> PyResult<()> {
+fn acknowledge_broadcast(subscriber_id: u32) -> PyResult<()> {
     let mut coord = COORDINATOR.lock().unwrap();
     match coord.as_mut() {
         Some(coord) => {
-            // Note: In a real implementation, we'd need to track which subscriber is acknowledging
-            // For now, this is a simplified version
-            coord.acknowledge(0); // Using subscriber ID 0 for simplicity
+            coord.acknowledge(subscriber_id);
             Ok(())
         }
         None => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("No coordinator created")),
