@@ -25,21 +25,22 @@ The system SHALL implement a synchronous broadcast mechanism where all subscribe
 - **AND** the subscriber SHALL wait for the next broadcast message
 
 ### Requirement: Broadcast Memory Management
-The system SHALL manage memory for single broadcast messages shared among all subscribers.
+The system SHALL manage memory for single broadcast messages shared among all subscribers using memory-mapped files.
 
-#### Scenario: Single Broadcast Slot
+#### Scenario: Single Memory-Mapped File
 - **WHEN** preparing a broadcast message
-- **THEN** the system SHALL allocate one memory slot for the broadcast
-- **AND** the slot SHALL be large enough for 35MB payloads
-- **AND** the slot SHALL be accessible to all subscribers
-- **AND** the slot SHALL be reused for subsequent broadcasts
+- **THEN** the system SHALL create one memory-mapped file for the broadcast
+- **AND** the file SHALL be large enough for 35MB payloads
+- **AND** the file SHALL be accessible to all subscribers as numpy arrays
+- **AND** the file SHALL be reused for subsequent broadcasts
 
-#### Scenario: Zero-Copy Broadcast
+#### Scenario: Zero-Copy Numpy Arrays
 - **WHEN** broadcasting a message
-- **THEN** all subscribers SHALL access the same memory location
+- **THEN** all subscribers SHALL access the same memory-mapped file
 - **AND** no data copying SHALL occur between publisher and subscribers
-- **AND** subscribers SHALL read directly from the broadcast slot
+- **AND** subscribers SHALL access data as read-only numpy arrays
 - **AND** memory access SHALL be synchronized to prevent race conditions
+- **AND** the publisher SHALL write directly to the memory-mapped file as a numpy array
 
 ### Requirement: Synchronous Coordination
 The system SHALL provide synchronization mechanisms for coordinating broadcast completion.
