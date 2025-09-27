@@ -19,6 +19,57 @@ use libc::{
     pthread_mutexattr_setpshared, PTHREAD_PROCESS_SHARED
 };
 
+// Futex types and constants for ultra-fast cross-process synchronization
+use libc::{
+    c_int, c_void, syscall,
+    SYS_futex, FUTEX_WAIT, FUTEX_WAKE, FUTEX_PRIVATE_FLAG
+};
+
+// Debug macro for stdout flushing (required for PyO3 debug output)
+macro_rules! debug_print {
+    ($($arg:tt)*) => {
+        {
+            print!("[DEBUG] ");
+            print!($($arg)*);
+            print!("\n");
+            io::stdout().flush().unwrap();
+        }
+    };
+}
+
+// Futex wrapper functions for maximum performance
+#[inline(always)]
+unsafe fn futex_wait(futex_addr: *mut u32, expected: u32, timeout_ms: u32) -> c_int {
+    debug_print!("FUTEX_WAIT: addr={:?}, expected={}, timeout={}ms", futex_addr, expected, timeout_ms);
+
+    let timespec = libc::timespec {
+        tv_sec: (timeout_ms / 1000) as i64,
+        tv_nsec: ((timeout_ms % 1000) * 1_000_000) as i64,
+    };
+
+    let result = syscall(SYS_futex,
+                        futex_addr as *const c_void,
+                        FUTEX_WAIT | FUTEX_PRIVATE_FLAG,
+                        expected as c_int,
+                        &timespec as *const libc::timespec) as c_int;
+
+    debug_print!("FUTEX_WAIT result: {} (errno: {})", result, std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
+    result
+}
+
+#[inline(always)]
+unsafe fn futex_wake(futex_addr: *mut u32, count: c_int) -> c_int {
+    debug_print!("FUTEX_WAKE: addr={:?}, count={}", futex_addr, count);
+
+    let result = syscall(SYS_futex,
+                        futex_addr as *const c_void,
+                        FUTEX_WAKE | FUTEX_PRIVATE_FLAG,
+                        count) as c_int;
+
+    debug_print!("FUTEX_WAKE result: {} (errno: {})", result, std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
+    result
+}
+
 // Debug macro for stdout flushing (required for PyO3 debug output)
 macro_rules! debug_print {
     ($($arg:tt)*) => {
@@ -98,18 +149,6 @@ macro_rules! with_lock_mut {
                 (*buffer).mutex.unlock();
             }
             result
-        }
-    };
-}
-
-/// Debug macro for stdout flushing (required for PyO3 debug output)
-macro_rules! debug_print {
-    ($($arg:tt)*) => {
-        {
-            print!("[DEBUG] ");
-            print!($($arg)*);
-            print!("\n");
-            io::stdout().flush().unwrap();
         }
     };
 }
@@ -209,6 +248,10 @@ pub struct SharedBroadcastBuffer {
     subscriber_ack_array: [u32; MAX_DYNAMIC_SUBSCRIBERS],  // Acknowledgment status per subscriber
     subscriber_reg_array: [u32; MAX_DYNAMIC_SUBSCRIBERS],  // Registration status per subscriber
 
+    // Futex-based acknowledgment system
+    ack_count: u32,                    // Number of acknowledgments received
+    ack_futex: u32,                    // Futex for acknowledgment notifications
+
     // Single broadcast slot accessible to all subscribers
     pub broadcast_data: [u8; BROADCAST_SLOT_SIZE],  // 35MB single broadcast slot
 }
@@ -277,6 +320,9 @@ impl SharedBroadcastBuffer {
             (*buffer).sequence_number = 0;
             (*buffer).broadcast_length = 0;
             (*buffer).max_subscriber_id = 0;
+            // Initialize futex-based acknowledgment system
+            (*buffer).ack_count = 0;
+            (*buffer).ack_futex = 0;
 
             // Initialize subscriber arrays
             for i in 0..MAX_DYNAMIC_SUBSCRIBERS {
@@ -474,6 +520,7 @@ impl BroadcastPublisher {
     /// This method will wait until ALL subscribers have acknowledged receipt
     /// of the message before returning.
     pub fn broadcast(&mut self, data: &[u8]) -> Result<u64, Box<dyn std::error::Error>> {
+        let broadcast_start_time = std::time::Instant::now();
         debug_print!("BroadcastPublisher::broadcast() called");
         debug_print!("  Data size: {} bytes", data.len());
 
@@ -488,17 +535,35 @@ impl BroadcastPublisher {
                      buffer.get_sequence_number(),
                      buffer.get_subscriber_count());
 
-        // Wait for any previous broadcast to complete
+        // Wait for any previous broadcast to complete using futex
         debug_print!("  Waiting for previous broadcast to complete...");
+        let wait_start = std::time::Instant::now();
         let mut wait_count = 0;
         while buffer.get_broadcast_state() != STATE_COMPLETED {
             wait_count += 1;
             if wait_count % 1000 == 0 {
                 debug_print!("    Still waiting... (wait_count: {})", wait_count);
             }
-            std::thread::sleep(std::time::Duration::from_millis(1));
+
+            // Use futex to wait efficiently for state changes
+            unsafe {
+                let current_state = buffer.broadcast_state;
+                // Wait for state to change from current state, with 10ms timeout
+                let result = futex_wait(&mut (*self.buffer).broadcast_state as *mut u32, current_state, 10);
+                if result == -1 {
+                    // Futex failed or timed out, continue loop
+                    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                    if errno != libc::ETIMEDOUT {
+                        debug_print!("    Futex wait error: {}", errno);
+                    }
+                }
+            }
         }
-        debug_print!("  Previous broadcast completed");
+        let wait_duration = wait_start.elapsed();
+        debug_print!("  Previous broadcast completed after {}.{:03}ms (wait_count: {})",
+                     wait_duration.as_millis(),
+                     wait_duration.as_micros() % 1000,
+                     wait_count);
 
         let sequence = buffer.get_sequence_number() + 1;
         let subscriber_count = buffer.get_subscriber_count();
@@ -543,13 +608,36 @@ impl BroadcastPublisher {
             }
         });
 
+        // Wake subscribers waiting for sequence number changes
+        debug_print!("    📢 PUBLISHER attempting to wake subscribers...");
+        unsafe {
+            // Use only the lower 32 bits for futex operations
+            let seq_futex = &mut (*self.buffer).broadcast_state; // Reuse state field as sequence futex
+            debug_print!("    📍 PUBLISHER wake addr: {:?}, current state: {}", seq_futex as *mut u32, (*self.buffer).broadcast_state);
+            let wake_result = futex_wake(seq_futex as *mut u32, 32); // Wake up to 32 subscribers
+            debug_print!("    📞 PUBLISHER futex_wake result: {}", wake_result);
+            if wake_result == -1 {
+                debug_print!("    ❌ PUBLISHER sequence futex wake error: {}", std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
+            } else {
+                debug_print!("    ✅ PUBLISHER woke {} subscribers waiting for sequence change", wake_result);
+            }
+        }
+
         // Use single unsafe block to reduce repeated dereferencing
         let buffer = unsafe { &mut *self.buffer };
 
-        // Wait for all subscribers to acknowledge
+        // Wait for all subscribers to acknowledge using futex-based acknowledgment counter
         debug_print!("  Waiting for all subscribers to acknowledge...");
+        let ack_wait_start = std::time::Instant::now();
         let mut ack_wait_count = 0;
+
+        // Reset acknowledgment counter before waiting
+        with_lock_mut!(buffer, {
+            buffer.ack_count = 0;
+        });
+
         loop {
+            let ack_check_start = std::time::Instant::now();
             let acknowledged_count = with_lock!(buffer, {
                 let mut count = 0;
                 let max_id = buffer.max_subscriber_id as usize;
@@ -568,6 +656,7 @@ impl BroadcastPublisher {
                 }
                 count
             });
+            let ack_check_duration = ack_check_start.elapsed();
 
             if acknowledged_count == subscriber_count {
                 debug_print!("  All {} subscribers acknowledged!", acknowledged_count);
@@ -576,12 +665,41 @@ impl BroadcastPublisher {
 
             ack_wait_count += 1;
             if ack_wait_count % 1000 == 0 {
-                debug_print!("    Waiting for acks... acknowledged: {}/{}, wait_count: {}",
-                             acknowledged_count, subscriber_count, ack_wait_count);
+                let ack_wait_duration = ack_wait_start.elapsed();
+                debug_print!("    Waiting for acks... acknowledged: {}/{}, wait_count: {}, total_wait: {}.{:03}ms, last_check: {}.{:03}ms",
+                             acknowledged_count, subscriber_count, ack_wait_count,
+                             ack_wait_duration.as_millis(), ack_wait_duration.as_micros() % 1000,
+                             ack_check_duration.as_micros() / 1000, ack_check_duration.as_micros() % 1000);
             }
 
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            // Use futex to wait efficiently for acknowledgment counter updates
+            debug_print!("    🔄 PUBLISHER calling futex_wait on ack_futex...");
+            unsafe {
+                let current_ack_count = buffer.ack_count;
+                debug_print!("    📍 PUBLISHER current ack_count: {}, ack_futex: {}, addr: {:?}",
+                             current_ack_count, buffer.ack_futex, &mut (*self.buffer).ack_futex as *mut u32);
+                // Wait for ack_count to change from current value, with 5ms timeout
+                let result = futex_wait(&mut (*self.buffer).ack_futex as *mut u32, current_ack_count, 5);
+                debug_print!("    📞 PUBLISHER ack futex wait returned: {}", result);
+                if result == -1 {
+                    // Futex failed or timed out, continue loop
+                    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                    debug_print!("    ⚠️  PUBLISHER ack futex wait error: {} (ETIMEDOUT={})", errno, libc::ETIMEDOUT);
+                    if errno != libc::ETIMEDOUT {
+                        debug_print!("    ❌ PUBLISHER unexpected ack futex error: {}", errno);
+                    }
+                } else {
+                    debug_print!("    ✅ PUBLISHER ack futex wait successful, checking acks again...");
+                }
+            }
+            debug_print!("    🔍 PUBLISHER after ack futex wait: ack_count={}, ack_futex={}",
+                         buffer.ack_count, buffer.ack_futex);
         }
+        let total_ack_wait_duration = ack_wait_start.elapsed();
+        debug_print!("  Total acknowledgment wait time: {}.{:03}ms ({} iterations)",
+                     total_ack_wait_duration.as_millis(),
+                     total_ack_wait_duration.as_micros() % 1000,
+                     ack_wait_count);
 
         // Reset acknowledgment bits for next broadcast
         debug_print!("  Resetting acknowledgment bits");
@@ -595,13 +713,41 @@ impl BroadcastPublisher {
             }
         });
 
+        // Reset acknowledgment bits for next broadcast
+        debug_print!("  Resetting acknowledgment bits");
+        let reset_start = std::time::Instant::now();
+        with_lock_mut!(buffer, {
+            let max_id = buffer.max_subscriber_id as usize;
+            let check_limit = if max_id == 0 { MAX_DYNAMIC_SUBSCRIBERS } else { max_id + 1 };
+            for i in 0..check_limit {
+                if buffer.subscriber_reg_array[i] != 0u32 {
+                    buffer.subscriber_ack_array[i] = 0;
+                }
+            }
+        });
+        let reset_duration = reset_start.elapsed();
+        debug_print!("  Acknowledgment reset took {}.{:03}ms",
+                     reset_duration.as_millis(),
+                     reset_duration.as_micros() % 1000);
+
         // Set state to COMPLETED
         debug_print!("  Setting state to COMPLETED");
         with_lock_mut!(buffer, {
             buffer.broadcast_state = STATE_COMPLETED;
         });
 
-        debug_print!("  BroadcastPublisher::broadcast() completed successfully");
+        // Wake any publishers waiting for state changes
+        unsafe {
+            let wake_result = futex_wake(&mut (*self.buffer).broadcast_state as *mut u32, 1);
+            if wake_result == -1 {
+                debug_print!("    State futex wake error: {}", std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
+            }
+        }
+
+        let total_broadcast_duration = broadcast_start_time.elapsed();
+        debug_print!("  BroadcastPublisher::broadcast() completed successfully in {}.{:03}ms",
+                     total_broadcast_duration.as_millis(),
+                     total_broadcast_duration.as_micros() % 1000);
         Ok(sequence)
     }
 
@@ -692,11 +838,34 @@ impl BroadcastSubscriber {
             }
 
             wait_count += 1;
-            if wait_count % 1000 == 0 {
-                debug_print!("    Still waiting for broadcast... state={}, sequence={}, wait_count={}",
+            if wait_count % 100 == 0 {
+                debug_print!("    ⏳ Still waiting for broadcast... state={}, sequence={}, wait_count={}",
                              state, sequence, wait_count);
             }
-            std::thread::sleep(std::time::Duration::from_millis(1));
+
+            // Use futex to wait efficiently for state changes (sequence changes trigger state changes)
+            debug_print!("    🔄 SUBSCRIBER calling futex_wait on broadcast_state...");
+            unsafe {
+                let current_state = buffer.broadcast_state;
+                debug_print!("    📍 SUBSCRIBER current state value: {}, addr: {:?}",
+                             current_state, &mut (*self.buffer).broadcast_state as *mut u32);
+                // Wait for state to change from current value, with 10ms timeout
+                let result = futex_wait(&mut (*self.buffer).broadcast_state as *mut u32, current_state, 10);
+                debug_print!("    📞 SUBSCRIBER futex wait returned: {}", result);
+                if result == -1 {
+                    // Futex failed or timed out, continue loop
+                    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                    debug_print!("    ⚠️  SUBSCRIBER futex wait error: {} (ETIMEDOUT={})", errno, libc::ETIMEDOUT);
+                    if errno != libc::ETIMEDOUT {
+                        debug_print!("    ❌ SUBSCRIBER unexpected futex error: {}", errno);
+                    }
+                } else {
+                    debug_print!("    ✅ SUBSCRIBER futex wait successful, checking state again...");
+                }
+            }
+            debug_print!("    🔍 SUBSCRIBER after futex wait: state={}, sequence={}",
+                         buffer.get_broadcast_state(),
+                         buffer.get_sequence_number());
         }
 
         // Read the broadcast data using the buffer reference we already have
@@ -721,9 +890,30 @@ impl BroadcastSubscriber {
                      with_lock!(buffer, { buffer.subscriber_reg_array[self.subscriber_id] }),
                      with_lock!(buffer, { buffer.subscriber_ack_array[self.subscriber_id] }));
 
+        debug_print!("    🔔 SUBSCRIBER acknowledging receipt...");
         with_lock_mut!(buffer, {
             buffer.subscriber_ack_array[self.subscriber_id] = 1;
+            // Increment acknowledgment counter and wake futex
+            buffer.ack_count += 1;
+            let new_ack_count = buffer.ack_count;
+            // Update futex value to wake waiting publisher
+            buffer.ack_futex = new_ack_count;
+            debug_print!("    📍 SUBSCRIBER set ack_count={}, ack_futex={}", new_ack_count, buffer.ack_futex);
         });
+
+        // Wake the publisher waiting for acknowledgments
+        debug_print!("    📢 SUBSCRIBER attempting to wake publisher...");
+        unsafe {
+            let wake_addr = &mut (*self.buffer).ack_futex as *mut u32;
+            debug_print!("    📍 SUBSCRIBER wake addr: {:?}, current ack_futex: {}", wake_addr, (*self.buffer).ack_futex);
+            let wake_result = futex_wake(wake_addr, 1);
+            debug_print!("    📞 SUBSCRIBER futex_wake result: {}", wake_result);
+            if wake_result == -1 {
+                debug_print!("    ❌ SUBSCRIBER futex wake error: {}", std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
+            } else {
+                debug_print!("    ✅ SUBSCRIBER woke {} publishers", wake_result);
+            }
+        }
 
         debug_print!("    After ack - subscriber {} registered: {}, ack: {}",
                      self.subscriber_id,
