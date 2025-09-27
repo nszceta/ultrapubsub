@@ -232,6 +232,31 @@ impl BroadcastPublisher {
         Self { buffer }
     }
 
+    /// Register a new subscriber with the broadcast buffer
+    pub fn register_subscriber(&mut self) -> usize {
+        let buffer = unsafe { &*self.buffer };
+
+        // Find first available subscriber ID
+        for i in 0..MAX_DYNAMIC_SUBSCRIBERS {
+            let is_registered = buffer.subscriber_reg_array[i].load(Ordering::Acquire);
+            if is_registered == 0 {
+                // Register this subscriber
+                buffer.subscriber_reg_array[i].store(1, Ordering::Release);
+                buffer.subscriber_count.fetch_add(1, Ordering::AcqRel);
+
+                // Update maximum subscriber ID
+                let current_max = buffer.max_subscriber_id.load(Ordering::Acquire);
+                if i as u32 > current_max {
+                    buffer.max_subscriber_id.store(i as u32, Ordering::Release);
+                }
+
+                return i;
+            }
+        }
+
+        panic!("Maximum subscribers ({}) reached", MAX_DYNAMIC_SUBSCRIBERS);
+    }
+
     /// Broadcast a message to all subscribers synchronously
     ///
     /// This method will wait until ALL subscribers have acknowledged receipt
@@ -280,15 +305,18 @@ impl BroadcastPublisher {
             (*self.buffer).broadcast_state.store(STATE_WAITING, Ordering::Release);
         }
 
+        // Use single unsafe block to reduce repeated dereferencing
+        let buffer = unsafe { &*self.buffer };
+
         // Wait for all subscribers to acknowledge
         loop {
             let mut acknowledged_count = 0;
-            let max_id = unsafe { (*self.buffer).max_subscriber_id.load(Ordering::Acquire) } as usize;
+            let max_id = buffer.max_subscriber_id.load(Ordering::Acquire) as usize;
             let check_limit = if max_id == 0 { MAX_DYNAMIC_SUBSCRIBERS } else { max_id + 1 };
 
             for i in 0..check_limit {
-                let is_registered = unsafe { (*self.buffer).subscriber_reg_array[i].load(Ordering::Acquire) };
-                let is_acknowledged = unsafe { (*self.buffer).subscriber_ack_array[i].load(Ordering::Acquire) };
+                let is_registered = buffer.subscriber_reg_array[i].load(Ordering::Acquire);
+                let is_acknowledged = buffer.subscriber_ack_array[i].load(Ordering::Acquire);
 
                 if is_registered != 0 && is_acknowledged != 0 {
                     acknowledged_count += 1;
@@ -303,19 +331,17 @@ impl BroadcastPublisher {
         }
 
         // Reset acknowledgment bits for next broadcast
-        let max_id = unsafe { (*self.buffer).max_subscriber_id.load(Ordering::Acquire) } as usize;
+        let max_id = buffer.max_subscriber_id.load(Ordering::Acquire) as usize;
         let check_limit = if max_id == 0 { MAX_DYNAMIC_SUBSCRIBERS } else { max_id + 1 };
         for i in 0..check_limit {
-            let is_registered = unsafe { (*self.buffer).subscriber_reg_array[i].load(Ordering::Acquire) };
+            let is_registered = buffer.subscriber_reg_array[i].load(Ordering::Acquire);
             if is_registered != 0 {
-                unsafe { (*self.buffer).subscriber_ack_array[i].store(0, Ordering::Release); }
+                buffer.subscriber_ack_array[i].store(0, Ordering::Release);
             }
         }
 
         // Set state to COMPLETED
-        unsafe {
-            (*self.buffer).broadcast_state.store(STATE_COMPLETED, Ordering::Release);
-        }
+        buffer.broadcast_state.store(STATE_COMPLETED, Ordering::Release);
 
         Ok(sequence)
     }
@@ -383,22 +409,21 @@ impl BroadcastSubscriber {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
 
-        // Read the broadcast data
-        let length = unsafe { (*self.buffer).broadcast_length.load(Ordering::Acquire) };
+        // Read the broadcast data using the buffer reference we already have
+        let length = buffer.broadcast_length.load(Ordering::Acquire);
         let mut data = vec![0u8; length as usize];
 
+        // Copy data from broadcast slot
         unsafe {
             ptr::copy_nonoverlapping(
-                (*self.buffer).broadcast_data.as_ptr(),
+                buffer.broadcast_data.as_ptr(),
                 data.as_mut_ptr(),
                 length as usize
             );
         }
 
         // Acknowledge receipt
-        unsafe {
-            (*self.buffer).subscriber_ack_array[self.subscriber_id].store(1, Ordering::Release);
-        }
+        buffer.subscriber_ack_array[self.subscriber_id].store(1, Ordering::Release);
 
         self.last_sequence = buffer.get_sequence_number();
         Ok(data)

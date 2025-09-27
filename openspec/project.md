@@ -70,6 +70,7 @@ The system must handle large data packets (typically about 35 MB) at high freque
 
 Use uv extensively when dealing with Python code. Use `uv add` to add packages to the local virtual environment and launch python scripts with `uv run`
 
+NEVER modify sys.path without my explicit permission.
 
 ## External Dependencies
 - **PyO3**: Rust bindings for Python to create seamless Python APIs

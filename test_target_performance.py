@@ -2,10 +2,8 @@
 """
 Test performance with 6 subscribers to match project requirements
 """
-import sys
 import time
 import os
-sys.path.insert(0, 'python')
 
 import ultrapubsub
 import multiprocessing as mp
