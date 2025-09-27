@@ -19,22 +19,35 @@ The system SHALL NOT hardcode the number of subscribers anywhere in the implemen
 - **AND** subscriber registration shall be completely dynamic and process-independent
 
 ### Requirement: Single Publisher Process Constraint
-The system SHALL enforce that exactly one publisher instance exists per process, and multiple publishers SHALL NOT be created within the same process.
+The system SHALL enforce that exactly one publisher instance exists per process, and multiple publishers SHALL NOT be created within the same process. Publishers MUST be launched as standalone spawned processes with no fork inheritance.
 
 #### Scenario: Publisher Process Isolation
 - **WHEN** a publisher is created in a process
 - **THEN** no additional publishers shall be allowed in the same process
 - **AND** attempts to create multiple publishers in one process shall fail
 - **AND** each publisher shall be bound to exactly one process for its lifetime
+- **AND** publishers MUST be launched as separate processes, not threads
 
 ### Requirement: One Process Per Subscriber Architecture
-The system SHALL enforce that exactly one subscriber instance exists per process, and multiple subscribers SHALL NOT be created within the same process.
+The system SHALL enforce that exactly one subscriber instance exists per process, and multiple subscribers SHALL NOT be created within the same process. Subscribers MUST be launched as standalone spawned processes with no fork inheritance.
 
 #### Scenario: Subscriber Process Isolation
 - **WHEN** a subscriber is created in a process
 - **THEN** no additional subscribers shall be allowed in the same process
 - **AND** attempts to create multiple subscribers in one process shall fail
 - **AND** each subscriber shall be bound to exactly one process for its lifetime
+- **AND** subscribers MUST be launched as separate processes, not threads
+
+### Requirement: Process-Based Benchmark Architecture
+Performance benchmarks MUST launch the publisher as a standalone spawned process and each subscriber as a separate standalone process. The orchestrator SHALL coordinate these processes with proper timeouts and resource management.
+
+#### Scenario: Process Orchestration
+- **WHEN** running performance benchmarks
+- **THEN** the publisher SHALL be launched as a standalone spawned process
+- **AND** each subscriber SHALL be launched as a separate standalone process
+- **AND** the orchestrator SHALL implement proper process management with timeouts
+- **AND** no processes shall be created through fork inheritance
+- **AND** all processes shall have proper cleanup and resource management
 
 #### Scenario: Reduced Acknowledgment Overhead
 - **WHEN** a publisher broadcasts a message
